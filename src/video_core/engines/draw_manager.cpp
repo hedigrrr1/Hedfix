@@ -18,6 +18,12 @@ namespace Tegra::Engines {
 namespace {
 
 void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
+    static u64 suppressed{};
+    if (++suppressed % 5000 == 1) {
+        LOG_INFO(HW_GPU, "Draws skipped by the render enable condition: {} (mode {}, override {})",
+                 suppressed, static_cast<u32>(maxwell3d.regs.render_enable.mode),
+                 static_cast<u32>(maxwell3d.regs.render_enable_override));
+    }
     if (!VideoCommon::RenderTrace::Enabled()) {
         return;
     }

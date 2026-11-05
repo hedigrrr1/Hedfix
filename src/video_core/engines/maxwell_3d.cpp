@@ -678,7 +678,10 @@ void Maxwell3D::ProcessQueryCondition() {
             break;
         }
         case Regs::RenderEnable::Mode::False: {
-            execute_on = false;
+            // EDEN_NX2_IGNORE_RENDER_ENABLE: draw while the condition is FALSE (to A/B draws a
+            // game hides with SET_RENDER_ENABLE_C).
+            static const bool ignore = std::getenv("EDEN_NX2_IGNORE_RENDER_ENABLE") != nullptr;
+            execute_on = ignore;
             break;
         }
         case Regs::RenderEnable::Mode::Conditional: {
