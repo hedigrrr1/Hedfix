@@ -97,6 +97,40 @@ TEST_CASE("Ampere ULEA carries through UP2 and UP3 into UIADD3.X", "[video_core]
     }
 }
 
+TEST_CASE("Ampere UIADD3 with an immediate carries through UP2 into UIADD3.X",
+          "[video_core][ampere][oot]") {
+    // UIADD3 UR10, UP2, UR10, 0xc, URZ then UIADD3.X UR11, URZ, UR11, URZ, UP2 from Ocarina.
+    const std::array<Instruction, 3> code{{{{0x0a0a7890, 0x0000000c, 0x0ff5e03f, 0x000fe200}},
+                                           {{0x3f0b7290, 0x0000000b, 0x097fe43f, 0x000fe200}},
+                                           Exit}};
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(static_cast<bool>(lowered));
+    const auto& out = lowered.instructions;
+    CHECK(std::any_of(out.begin(), out.end(), [](u64 i) {
+        return (i >> 48) == 0x5ca0 && ((i >> 39) & 7) == 4;
+    }));
+}
+
+TEST_CASE("Ampere F2IP.U8.F32 packs two clamped bytes", "[video_core][ampere][oot]") {
+    // F2IP.U8.F32 R41, R40, R39, RZ and R42, R42, R37, RZ from Ocarina's RGBA8 packing.
+    for (const auto& [insn, expected] :
+         {std::pair{Instruction{{0x28297243, 0x00000027, 0x000004ff, 0x000fc400}},
+                    0x5c1804000f87f929ULL},
+          std::pair{Instruction{{0x2a2a7243, 0x00000025, 0x000004ff, 0x000fe400}},
+                    0x5c1804000f87f92aULL}}) {
+        const std::array<Instruction, 2> code{{insn, Exit}};
+        const auto lowered = LowerToMaxwell(code);
+        INFO(lowered.error);
+        REQUIRE(static_cast<bool>(lowered));
+        const auto& out = lowered.instructions;
+        // Two F2I into R248 (Rb) and R249 (Ra), then Rd = (R249 << 8) + R248.
+        CHECK(std::count_if(out.begin(), out.end(),
+                            [](u64 i) { return (i >> 48) == 0x5cb0; }) == 2);
+        CHECK(std::find(out.begin(), out.end(), expected) != out.end());
+    }
+}
+
 TEST_CASE("Ampere LEA with a constant base and no carry out lowers to ISCADD", "[video_core][ampere]") {
     // LEA R0, R0, c[0][0x2e0]-style constant, 0x8 from Pokemon Pokopia's album compute shaders.
     const std::array<Instruction, 2> code{{{{0x00007a11, 0x01002e00, 0x078e40ff, 0x000fe200}}, Exit}};

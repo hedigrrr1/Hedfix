@@ -2105,6 +2105,33 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
 
         case 0x243:
+            // F2IP.U8.F32 Rd, Ra, Rb, RZ: two bytes, Rb's in bits 0-7 and Ra's in 8-15 (Ocarina
+            // packs RGBA8 pixels with two of these and a PRMT). Bits 78-79 round as F2I's do.
+            if (insn.Bits(24, 8) != 255) {
+                const u32 high = insn.Bits(24, 8), low = insn.Bits(32, 8);
+                if ((insn.words[1] & ~0xffU) || (insn.words[2] & ~0xc000U) != 0x000004ffU ||
+                    high >= 246 || low >= 246)
+                    return fail(index, "native packed float-to-byte mode");
+                for (const auto [source, target] : {std::pair{low, 248U}, std::pair{high, 249U}}) {
+                    // NaN to 0, clamp to [0, 255], then convert, as the one-byte form below.
+                    emit(0x5800000000000000ULL | predicate | 250 | (u64{source} << 8) |
+                         (u64{source} << 20) | (u64{7} << 39) | (u64{7} << 48));
+                    emit(0x5c40000000000000ULL | predicate | 250 | (u64{source} << 8) |
+                         (u64{250} << 20) | (u64{7} << 48));
+                    mov_imm(252, 0);
+                    emit(0x5c60000000000000ULL | predicate | 250 | (u64{250} << 8) |
+                         (u64{252} << 20) | (u64{15} << 39));
+                    mov_imm(252, 0x437f0000U);
+                    emit(0x5c60000000000000ULL | predicate | 250 | (u64{250} << 8) |
+                         (u64{252} << 20) | (u64{7} << 39));
+                    emit(0x5cb0000000000000ULL | predicate | target | (u64{2} << 8) |
+                         (u64{2} << 10) | (u64{250} << 20) | (u64{insn.Bits(78, 2)} << 39));
+                }
+                // Rd = (high << 8) + low.
+                emit(base(0x5c18000000000000ULL) | (u64{249} << 8) | (u64{248} << 20) |
+                     (u64{8} << 39));
+                break;
+            }
             if (insn.Bits(24, 8) != 255 || (insn.words[1] & ~0xffU) ||
                 insn.words[2] != 0x0000c4ffU)
                 return fail(index, "native packed float-to-byte mode");
@@ -3526,9 +3553,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 const bool carry_in = insn.Bits(74, 1) != 0;
                 const u32 carry_out = insn.Bits(81, 3);
                 const u32 a = insn.Bits(24, 8);
-                if ((carry_in && carry_out != 7) || (opcode == 0x210 && (insn.words[1] & ~0xffU)) ||
-                    (rewritten_uniform && carry_out != 7 && carry_out > 1) ||
-                    (rewritten_uniform && carry_in && insn.Bits(87, 3) > 1 && insn.Bits(87, 3) != 7))
+                // Any UPn works: it is moved through P(6-n), which is saved and restored around it.
+                if ((carry_in && carry_out != 7) || (opcode == 0x210 && (insn.words[1] & ~0xffU)))
                     return fail(index, "native integer carry mode");
                 if (opcode == 0x810) {
                     emit(0x1c00000000000000ULL | predicate | 250 | (u64{a} << 8) | (u64{insn.words[1]} << 20));
