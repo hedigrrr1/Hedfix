@@ -541,7 +541,7 @@ index f8b8cd96bf..ec12bce2ea 100644
  
      /// The sampled textures of the last configured draw, kept while a sampled frame dump runs.
 diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-index fe75fae096..0d31638e01 100644
+index fe75fae096..9f18a96641 100644
 --- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 @@ -439,14 +439,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
@@ -569,7 +569,59 @@ index fe75fae096..0d31638e01 100644
          }
      }
      if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
-@@ -1358,13 +1364,29 @@ void RasterizerVulkan::DispatchCompute() {
+@@ -606,6 +612,35 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
+ }
+ } // Anonymous namespace
+ 
++namespace {
++// EDEN_NX2_TRACE_DST=<hex>: also log draws and depth clears whose depth target lies within 32 MiB
++// above that GPU address, as the DMA and 2D engines do for their copies.
++void TraceDepthTarget(const Tegra::Engines::Maxwell3D& maxwell3d, const char* what, bool active) {
++    static const u64 destination = [] {
++        const char* value = std::getenv("EDEN_NX2_TRACE_DST");
++        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
++    }();
++    static u32 lines{};
++    const auto& regs = maxwell3d.regs;
++    if (destination == 0 || !active || lines >= 2000) {
++        return;
++    }
++    const GPUVAddr zeta = regs.zeta.Address();
++    if (zeta < destination || zeta >= destination + (32ULL << 20)) {
++        return;
++    }
++    ++lines;
++    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
++    const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
++    LOG_INFO(HW_GPU,
++             "nx2 {} to traced depth: {:#x} format={:#x} {}x{} write={} test={} func={} vs={:#x} "
++             "ps={:#x} rt0={:#x} clear_depth={}",
++             what, zeta, static_cast<u32>(regs.zeta.format), regs.zeta_size.width,
++             regs.zeta_size.height, regs.depth_write_enabled, regs.depth_test_enable,
++             static_cast<u32>(regs.depth_test_func), vs, ps, regs.rt[0].Address(), regs.clear_depth);
++}
++} // Anonymous namespace
++
+ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+     {
+@@ -724,6 +759,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+         if (std::find(skip_list.begin(), skip_list.end(), vs) != skip_list.end()) return;
+     }
++    TraceDepthTarget(*maxwell3d, "draw", maxwell3d->regs.zeta_enable != 0);
+     // EDEN_NX2_RT_TRACE: log the first draw to every distinct colour target (debug aid).
+     if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {
+         static std::set<std::tuple<GPUVAddr, u32, u32, u64, u64>> seen;
+@@ -1109,6 +1145,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+                            regs.clear_surface.A;
+     const bool use_depth = regs.clear_surface.Z;
+     const bool use_stencil = regs.clear_surface.S;
++    TraceDepthTarget(*maxwell3d, "clear", use_depth && regs.zeta_enable != 0);
+     if (!use_color && !use_depth && !use_stencil) {
+         return;
+     }
+@@ -1358,13 +1395,29 @@ void RasterizerVulkan::DispatchCompute() {
      if (frame_dump.CapturingSampled()) {
          boost::container::small_vector<FrameDump::Sampled, 16> sampled;
          for (const auto& image : pipeline->SampledImages()) {
@@ -600,7 +652,7 @@ index fe75fae096..0d31638e01 100644
      if (indirect_address) {
          // DispatchIndirect
          static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
-@@ -1852,6 +1874,36 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64>
+@@ -1852,6 +1905,36 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64>
      });
  }
  
@@ -637,7 +689,7 @@ index fe75fae096..0d31638e01 100644
  void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
      std::array<ImageView*, VideoCommon::NUM_RT> colors{};
      const auto& ids = texture_cache.GetRenderTargets().color_buffer_ids;
-@@ -1868,7 +1920,8 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
+@@ -1868,7 +1951,8 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
  void RasterizerVulkan::TickFrame() {
      if (VideoCore::Nx2Debug::HasRequests()) {
          if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
