@@ -10,6 +10,7 @@
 #include <type_traits>
 #include <bit>
 #include <numeric>
+#include <optional>
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
@@ -338,6 +339,62 @@ bool FoldXmadMultiply(IR::Block& block, IR::Inst& inst) {
     return true;
 }
 
+// (BitFieldUExtract(v, 16, 16) << 16) + BitFieldUExtract(v, 0, 16) is v. A 64-bit add written
+// as IMAD.WIDE.U32 by one leaves this after XMAD lowering, and it hides the pointer from storage
+// buffer tracking (Ocarina of Time's particle counters went to the offset's "buffer").
+bool FoldHalvesRecombine(IR::Inst& inst) {
+    const auto field = [](const IR::Value& value, u32 offset) -> std::optional<IR::Value> {
+        if (value.IsImmediate()) {
+            return std::nullopt;
+        }
+        const IR::Inst* const extract{value.InstRecursive()};
+        if (extract->GetOpcode() != IR::Opcode::BitFieldUExtract ||
+            !extract->Arg(1).IsImmediate() || !extract->Arg(2).IsImmediate() ||
+            extract->Arg(1).U32() != offset || extract->Arg(2).U32() != 16) {
+            return std::nullopt;
+        }
+        return extract->Arg(0).Resolve();
+    };
+    for (size_t index = 0; index < 2; ++index) {
+        const IR::Value shifted{inst.Arg(index)};
+        if (shifted.IsImmediate()) {
+            continue;
+        }
+        const IR::Inst* const shift{shifted.InstRecursive()};
+        if (shift->GetOpcode() != IR::Opcode::ShiftLeftLogical32 || !shift->Arg(1).IsImmediate() ||
+            shift->Arg(1).U32() != 16) {
+            continue;
+        }
+        const std::optional<IR::Value> high{field(shift->Arg(0), 16)};
+        const std::optional<IR::Value> low{field(inst.Arg(1 - index), 0)};
+        if (high && low && *high == *low) {
+            inst.ReplaceUsesWith(*high);
+            return true;
+        }
+    }
+    return false;
+}
+
+void FoldIMul32(IR::Inst& inst) {
+    if (FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a * b; })) {
+        return;
+    }
+    for (size_t index = 0; index < 2; ++index) {
+        const IR::Value factor{inst.Arg(index)};
+        if (!factor.IsImmediate()) {
+            continue;
+        }
+        if (factor.U32() == 1) {
+            inst.ReplaceUsesWith(inst.Arg(1 - index));
+            return;
+        }
+        if (factor.U32() == 0) {
+            inst.ReplaceUsesWith(IR::Value{u32{0}});
+            return;
+        }
+    }
+}
+
 template <typename T>
 void FoldAdd(IR::Block& block, IR::Inst& inst) {
     if (inst.HasAssociatedPseudoOperation()) {
@@ -352,6 +409,9 @@ void FoldAdd(IR::Block& block, IR::Inst& inst) {
         return;
     }
     if constexpr (std::is_same_v<T, u32>) {
+        if (FoldHalvesRecombine(inst)) {
+            return;
+        }
         if (FoldXmadMultiply(block, inst)) {
             return;
         }
@@ -998,8 +1058,7 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
     case IR::Opcode::SMax32:
         return FoldSMax32(block, inst);
     case IR::Opcode::IMul32:
-        FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a * b; });
-        return;
+        return FoldIMul32(inst);
     case IR::Opcode::ShiftRightArithmetic32:
         FoldWhenAllImmediates(inst, [](s32 a, s32 b) { return static_cast<u32>(a >> b); });
         return;

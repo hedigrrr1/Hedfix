@@ -40,7 +40,7 @@ For Kirby Air Riders, capture from before entering the cutscene through the cras
 
 Search the log for `nx2:vdec trace`.
 
-- `submit` records packet size, timestamp, EOS, and the input queue length. Eight queued packets suppress the readiness signal but do not reject a submission. Older builds logged `input full` and rejected packets; Mario Tennis advances past those packets instead of retrying, corrupting VP9 reference frames.
+- `submit` records packet size, timestamp, EOS, and the input queue length. Eight queued packets suppress the readiness signal but do not reject a submission, except in Ocarina of Time, whose player ran slow while its demuxer queued whole movies: there a ninth packet is refused with `0x1c266f` and logged as `input full`. `EDEN_NX2_VDEC_INPUT_LIMIT=<n>` sets that limit for any game (0: none). Older builds logged `input full` and rejected packets; Mario Tennis advances past those packets instead of retrying, corrupting VP9 reference frames.
 - `decode` records codec, whether FFmpeg opened, pictures produced, the total decoded-frame count, and whether a flush discards those pictures.
 - `write` records the output image, CPU address, GPU address, device address, layout, timestamp, and EOS. `gpu_known=false` means no GPU address was established, not that GPU address zero is valid.
 - `present` compares the presented image and device address with the latest decoded image write. `same_image` and `same_device` are direct identity comparisons, not proof that the game sampled the video texture. A game can blit the movie into another surface, and a ring can present an older decoded image.

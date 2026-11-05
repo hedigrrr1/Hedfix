@@ -51,7 +51,7 @@ Use these before guessing. All are off unless the variable is set; pass them as 
 | Draw and render-state questions | `EDEN_NX2_RENDER_TRACE=1`, filter `*:Info HW.GPU:Debug Render.Vulkan:Debug Shader:Debug` | Per-draw state, rejected stages and zero-format texture descriptors. |
 | Missing geometry from tessellation pipelines (log: `Patch topology not used with tessellation`) | `EDEN_NX2_DROP_TESS=1` | Those pipelines drop their tessellation stages instead of forcing a patch list; the warning names the topology, patch size and shader hashes. Task/mesh pipelines (mesh program in the tessellation slot) are not affected. |
 | Objects missing while the render trace logs `Render trace suppressed` (draws hidden by the render enable condition) | `EDEN_NX2_IGNORE_RENDER_ENABLE=1` | Draws run while SET_RENDER_ENABLE_C is FALSE; the log counts skipped draws (`Draws skipped by the render enable condition`) either way. |
-| Video playback | `EDEN_NX2_VDEC_TRACE=1`, `EDEN_NX2_VDEC_DUMP=<dir>` | Decoder submit, decode and composite trace; decoded frames. |
+| Video playback | `EDEN_NX2_VDEC_TRACE=1`, `EDEN_NX2_VDEC_DUMP=<dir>`; `EDEN_NX2_VDEC_INPUT_LIMIT=<n>` refuses packets past n queued (default 8 in Ocarina of Time, none elsewhere) | Decoder submit, decode and composite trace; decoded frames. |
 | Performance and frame pacing | `EDEN_NX2_GPU_PROFILE=1`, `EDEN_DKB_FRAME_TRACE=1` | GPU thread time per second by zone; per-present interval, CPU and fence timing. |
 | Command corruption or pop-in | `EDEN_NX2_PB_CHECK=1`; A/B with `EDEN_NX2_PB_SNAPSHOT=0` or `EDEN_NX2_FETCH_DRAIN=1` | How many pushbuffer entries change between submit and parse. |
 | Split GPU thread races | `EDEN_NX2_SPLIT_CHECK=1` | Reports scheduler use from the wrong thread. |

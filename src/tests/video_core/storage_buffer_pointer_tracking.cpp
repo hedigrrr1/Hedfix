@@ -340,3 +340,24 @@ TEST_CASE("NVN fallback descriptors use guest slots rather than compact binding 
     std::ranges::reverse(reversed);
     CHECK(selected(reversed) == std::vector<u32>{0x400, 0x340});
 }
+
+TEST_CASE("A pointer added through a 64-bit multiply-add by one is tracked",
+          "[shader][storage_buffer]") {
+    // Ocarina of Time's particle counters: UIMAD.WIDE.U32 UR10, UR4 (= 1), c[0][0x90], c[1][0x0].
+    // XMAD lowering leaves the pointer as (hi16 * 1 + lo16 * 0) << 16 + lo16 * 1.
+    KernelProgram fixture;
+    fixture.env.native = true;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 lane{ir.LocalInvocationIdX()};
+    const IR::U32 pointer{Word(ir, 0x90)};
+    const IR::U32 high_half{ir.BitFieldExtract(pointer, ir.Imm32(16), ir.Imm32(16))};
+    const IR::U32 low_half{ir.BitFieldExtract(pointer, ir.Imm32(0), ir.Imm32(16))};
+    const IR::U32 rebuilt{ir.IAdd(
+        ir.ShiftLeftLogical(ir.IAdd(ir.IMul(ir.Imm32(1), high_half), ir.IMul(ir.Imm32(0), low_half)),
+                            ir.Imm32(16)),
+        ir.IMul(ir.Imm32(1), low_half))};
+    const IR::U32 offset{ir.GetCbuf(ir.Imm32(1), ir.Imm32(0))};
+    ir.WriteGlobal32(Address(ir, ir.IAdd(rebuilt, offset), Word(ir, 0x94)), lane);
+    Shader::Optimization::ConstantPropagationPass(fixture.env, fixture.program);
+    CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x90});
+}
