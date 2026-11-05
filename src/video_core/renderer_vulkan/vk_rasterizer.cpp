@@ -612,18 +612,22 @@ void TraceDepthTarget(const Tegra::Engines::Maxwell3D& maxwell3d, const char* wh
         const char* value = std::getenv("EDEN_NX2_TRACE_DST");
         return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
     }();
-    static u32 lines{};
     const auto& regs = maxwell3d.regs;
-    if (destination == 0 || !active || lines >= 2000) {
+    if (destination == 0 || !active) {
         return;
     }
     const GPUVAddr zeta = regs.zeta.Address();
     if (zeta < destination || zeta >= destination + (32ULL << 20)) {
         return;
     }
-    ++lines;
     const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
     const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+    // Once per writer: a target is drawn every frame.
+    static std::set<std::tuple<std::string_view, GPUVAddr, u64, u64, u32>> seen;
+    if (seen.size() >= 512 ||
+        !seen.emplace(what, zeta, vs, ps, regs.depth_write_enabled).second) {
+        return;
+    }
     LOG_INFO(HW_GPU,
              "nx2 {} to traced depth: {:#x} format={:#x} {}x{} write={} test={} func={} vs={:#x} "
              "ps={:#x} rt0={:#x} clear_depth={}",
