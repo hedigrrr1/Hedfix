@@ -117,7 +117,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         switch (instruction.Bits(0, 12)) {
         case 0x202: case 0x802: case 0x424: case 0x724: case 0x824: case 0xe24: case 0x227:
         case 0x810: case 0x819: case 0x845: case 0x906: case 0x820:
-        case 0x812: case 0x589:
+        case 0x812: case 0x589: case 0x803:
         case 0x212: case 0x207: case 0x807: case 0x208: case 0x808:
         case 0x220: case 0xa20: case 0x221: case 0x421: case 0x621:
         case 0x223: case 0x423: case 0x623: case 0x823: case 0xa23:
@@ -3418,10 +3418,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 break;
             }
             // A carry out (bits 81-83) is the low half of a 64-bit address; IADD3.X adds it next.
+            // A uniform carry UPn (any of UP0-UP6) goes through P(6-n) into R239.
             const u32 carry_out = insn.Bits(81, 3);
             if (insn.Bits(72, 1) || insn.Bits(74, 1) || insn.Bits(80, 1) ||
                 (carry_out != 7 && ((opcode != 0x811 && insn.Bits(63, 1)) ||
-                                    (rewritten_uniform && (opcode != 0x211 || carry_out > 1)))) ||
+                                    (rewritten_uniform && opcode != 0x211))) ||
                 ((opcode == 0x211 || opcode == 0xa11) && insn.Bits(62, 1)) || (opcode == 0xc11 && (insn.words[1] & ~0x8000003fU)))
                 return fail(index, "native LEA carry/high mode");
             // 0x211 bit 63 negates Rb (LEA Rd, Ra, -Rb, s), as Maxwell ISCADD's bit 48.

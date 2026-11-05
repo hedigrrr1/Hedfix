@@ -72,6 +72,31 @@ TEST_CASE("Ampere indexed ULDC of bytes and halfwords lowers to an indexed Maxwe
     CHECK_FALSE(static_cast<bool>(LowerToMaxwell(std::array{odd, Exit})));
 }
 
+TEST_CASE("Ampere ULEA carries through UP2 and UP3 into UIADD3.X", "[video_core][ampere][oot]") {
+    // ULEA UR4, UR4, UR11, 0x2 with its carry in UP2 (UP3), then UIADD3.X UR5, URZ, UR5, URZ,
+    // UP2 (UP3): the 64-bit address arithmetic of Ocarina's compute programs.
+    const std::array<std::pair<std::array<Instruction, 3>, u32>, 2> sequences{{
+        {{{{{0x0b047291, 0x00000004, 0x0f84103f, 0x000fc600}},
+           {{0x3f057290, 0x00000005, 0x097fe43f, 0x000fe400}}, Exit}}, 2},
+        {{{{{0x070a7291, 0x0000000a, 0x0f86103f, 0x000fe200}},
+           {{0x3f0b7290, 0x0000000b, 0x09ffe43f, 0x000fe200}}, Exit}}, 3},
+    }};
+    for (const auto& [code, up] : sequences) {
+        const auto lowered = LowerToMaxwell(code);
+        INFO(lowered.error);
+        REQUIRE(static_cast<bool>(lowered));
+        const auto& out = lowered.instructions;
+        const u64 slot = 6 - up;
+        // ISETP writes the carry to P(6-n); IADD3.X selects it back from P(6-n).
+        CHECK(std::any_of(out.begin(), out.end(), [&](u64 i) {
+            return (i >> 48) == 0x5b60 && ((i >> 3) & 7) == slot;
+        }));
+        CHECK(std::any_of(out.begin(), out.end(), [&](u64 i) {
+            return (i >> 48) == 0x5ca0 && ((i >> 39) & 7) == slot;
+        }));
+    }
+}
+
 TEST_CASE("Ampere LEA with a constant base and no carry out lowers to ISCADD", "[video_core][ampere]") {
     // LEA R0, R0, c[0][0x2e0]-style constant, 0x8 from Pokemon Pokopia's album compute shaders.
     const std::array<Instruction, 2> code{{{{0x00007a11, 0x01002e00, 0x078e40ff, 0x000fe200}}, Exit}};
