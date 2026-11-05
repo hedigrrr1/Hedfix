@@ -1,0 +1,738 @@
+diff --git a/src/core/debugger/nx2_debug_tools.cpp b/src/core/debugger/nx2_debug_tools.cpp
+index 3adafeb747..4e1657e164 100644
+--- a/src/core/debugger/nx2_debug_tools.cpp
++++ b/src/core/debugger/nx2_debug_tools.cpp
+@@ -225,8 +225,10 @@ json CaptureFrame(ToolState& state, const json& params) {
+     const auto directory = state.dump_directory / fmt::format("capture-{}-{:03}", state.session, id);
+     std::filesystem::create_directories(directory);
+     const bool sampled = params.value("sampled", false);
++    const bool buffers = params.value("buffers", false);
+     const int timeout = Param<int>(params, "timeout_s", 120, 1, 600);
+-    VideoCore::Nx2Debug::RequestCapture({.id = id, .directory = directory, .sampled = sampled});
++    VideoCore::Nx2Debug::RequestCapture(
++        {.id = id, .directory = directory, .sampled = sampled, .buffers = buffers});
+     const auto finished = VideoCore::Nx2Debug::WaitCapture(id, std::chrono::seconds{timeout});
+     if (!finished) {
+         VideoCore::Nx2Debug::CancelCapture(id);
+@@ -265,6 +267,7 @@ json CaptureFrame(ToolState& state, const json& params) {
+     return {
+         {"directory", directory.generic_string()},
+         {"sampled", sampled},
++        {"buffers", buffers},
+         {"frame", std::move(frame)},
+         {"summary", std::move(summary)},
+         {"kinds", std::move(kinds)},
+diff --git a/src/video_core/nx2_debug_control.h b/src/video_core/nx2_debug_control.h
+index ee903d0f6b..da32c0e3b5 100644
+--- a/src/video_core/nx2_debug_control.h
++++ b/src/video_core/nx2_debug_control.h
+@@ -22,6 +22,8 @@ struct CaptureRequest {
+     u64 id;
+     std::filesystem::path directory;
+     bool sampled;
++    /// The uniform and storage buffers of every draw and dispatch, and dispatch group counts.
++    bool buffers;
+ };
+ 
+ struct CaptureResult {
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 3c44830833..52b813f8bc 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -442,7 +442,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+                              Shader::NumDescriptors(info.image_buffer_descriptors);
+         for (size_t index = first; index < first + Shader::NumDescriptors(info.texture_descriptors);
+              ++index) {
+-            sampled_images.push_back({views[index].index, views[index].id});
++            sampled_images.push_back({views[index].index, views[index].id, samplers[index - first]});
+         }
+     }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+index 5df3c5179f..d28660665a 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -74,6 +74,7 @@ public:
+     struct SampledImage {
+         u32 tic;
+         VideoCommon::ImageViewId id;
++        VideoCommon::SamplerId sampler;
+     };
+ 
+     /// The textures sampled by the last configured dispatch, kept while a sampled frame dump runs.
+diff --git a/src/video_core/renderer_vulkan/vk_frame_dump.cpp b/src/video_core/renderer_vulkan/vk_frame_dump.cpp
+index c118747fc5..747f985aa7 100644
+--- a/src/video_core/renderer_vulkan/vk_frame_dump.cpp
++++ b/src/video_core/renderer_vulkan/vk_frame_dump.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include "common/cityhash.h"
+ #include "common/logging.h"
+ #include "common/settings.h"
+ #include "common/stb.h"
+@@ -182,6 +183,51 @@ std::string JsonArray(std::span<T> values) {
+     return out + "]";
+ }
+ 
++std::string_view FilterName(VkFilter filter) {
++    return filter == VK_FILTER_NEAREST ? "nearest" : filter == VK_FILTER_LINEAR ? "linear" : "other";
++}
++
++std::string_view WrapName(VkSamplerAddressMode mode) {
++    switch (mode) {
++    case VK_SAMPLER_ADDRESS_MODE_REPEAT:
++        return "repeat";
++    case VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT:
++        return "mirrored_repeat";
++    case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:
++        return "clamp_to_edge";
++    case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER:
++        return "clamp_to_border";
++    case VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE:
++        return "mirror_clamp_to_edge";
++    default:
++        return "other";
++    }
++}
++
++/// The host sampler state and the raw guest TSC words it came from.
++std::string SamplerJson(const Sampler* sampler) {
++    if (!sampler) {
++        return {};
++    }
++    const VkSamplerCreateInfo& ci = sampler->CreateInfo();
++    std::array<u32, 8> words;
++    static_assert(sizeof(words) == sizeof(Tegra::Texture::TSCEntry));
++    std::memcpy(words.data(), &sampler->Descriptor(), sizeof(words));
++    std::string tsc;
++    for (const u32 word : words) {
++        tsc += fmt::format("{}\"{:08x}\"", tsc.empty() ? "" : ",", word);
++    }
++    return fmt::format(
++        R"(,"sampler":{{"mag":"{}","min":"{}","mip":"{}","wrap":["{}","{}","{}"],"unnormalized":{},"compare":{},"compare_op":{},"lod_bias":{},"min_lod":{},"max_lod":{},"anisotropy":{},"tsc":[{}]}})",
++        FilterName(ci.magFilter), FilterName(ci.minFilter),
++        ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR ? "linear" : "nearest",
++        WrapName(ci.addressModeU), WrapName(ci.addressModeV), WrapName(ci.addressModeW),
++        ci.unnormalizedCoordinates != VK_FALSE, ci.compareEnable != VK_FALSE,
++        static_cast<u32>(ci.compareOp), JsonNumber(ci.mipLodBias), JsonNumber(ci.minLod),
++        JsonNumber(ci.maxLod), ci.anisotropyEnable != VK_FALSE ? JsonNumber(ci.maxAnisotropy) : "1",
++        tsc);
++}
++
+ } // Anonymous namespace
+ 
+ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
+@@ -219,8 +265,8 @@ void FrameDump::StopWriter() {
+     stop_writer = false;
+ }
+ 
+-void FrameDump::Arm(std::filesystem::path directory_, bool sampled, u64 id) {
+-    if (!schedule.Arm(sampled, id)) {
++void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers, u64 id) {
++    if (!schedule.Arm(sampled, buffers, id)) {
+         VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
+         return;
+     }
+@@ -233,6 +279,8 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, u64 id) {
+     images = 0;
+     pass_framebuffer = nullptr;
+     dispatch_sampled.clear();
++    seen_buffers.clear();
++    written_buffers.clear();
+     pass_index = 0;
+     draws = 0;
+     dispatches = 0;
+@@ -361,6 +409,7 @@ std::optional<std::pair<GPUVAddr, u32>> SampledKey(const FrameDump::Sampled& tex
+ 
+ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string name,
+                               std::string tags) {
++    tags += SamplerJson(texture.sampler);
+     if (const auto target = MakeTarget(*texture.view, index)) {
+         return Record(*target, std::move(name), std::move(tags));
+     }
+@@ -414,6 +463,52 @@ void FrameDump::NoteDispatchSampled(u64 shader_hash, std::span<const Sampled> te
+     }
+ }
+ 
++bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
++                            std::span<BoundBuffer> buffers) {
++    bool recorded = false;
++    for (BoundBuffer& buffer : buffers) {
++        const size_t program = compute ? 0 : buffer.stage + 1;
++        const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
++        const std::tuple<u64, bool, u32, u64, u32> key{shader, buffer.storage, buffer.index,
++                                                       buffer.device_addr, buffer.size};
++        if (std::ranges::find(seen_buffers, key) != seen_buffers.end()) {
++            continue;
++        }
++        seen_buffers.push_back(key);
++        const std::string owner =
++            compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
++                    : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
++        const bool from_host = buffer.guest.empty();
++        std::string tags = fmt::format(
++            R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","type":"{}","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
++            owner, buffer.stage, shader, buffer.storage ? "storage" : "uniform", buffer.index,
++            buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size, buffer.size,
++            buffer.gpu_modified, from_host ? "host" : "guest");
++        if (!from_host) {
++            Enqueue({.tags = std::move(tags), .data = std::move(buffer.guest), .raw = true});
++            continue;
++        }
++        recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));
++    }
++    return recorded;
++}
++
++void FrameDump::NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
++                           const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,
++                           std::optional<std::array<u32, 3>> indirect_grid) {
++    std::string tags = fmt::format(
++        R"({{"kind":"launch","dispatch":{},"after_draws":{},"shaders":["{:016x}"],"grid":[{},{},{}],"block":[{},{},{}])",
++        dispatches, draws, shader_hash, grid[0], grid[1], grid[2], block[0], block[1], block[2]);
++    if (indirect) {
++        tags += fmt::format(R"(,"indirect":"{:#x}")", *indirect);
++    }
++    if (indirect_grid) {
++        tags += fmt::format(R"(,"indirect_grid_guest":[{},{},{}])", (*indirect_grid)[0],
++                            (*indirect_grid)[1], (*indirect_grid)[2]);
++    }
++    Enqueue({.tags = tags + "}"});
++}
++
+ void FrameDump::NoteDraw(std::span<const u64> shader_hashes) {
+     ++draws;
+     for (const u64 hash : shader_hashes) {
+@@ -532,6 +627,51 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
+     return true;
+ }
+ 
++bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags) {
++    if (recorded_bytes + size > SIZE_CAP) {
++        truncated = true;
++        return false;
++    }
++    recorded_bytes += size;
++    vk::Buffer buffer = memory_allocator.CreateBuffer(
++        VkBufferCreateInfo{
++            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++            .size = size,
++            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++        },
++        MemoryUsage::Download);
++    const VkBufferCopy copy{.srcOffset = offset, .dstOffset = 0, .size = size};
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([source, destination = *buffer, copy](vk::CommandBuffer cmdbuf) {
++        const VkMemoryBarrier before{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               0, before);
++        cmdbuf.CopyBuffer(source, destination, copy);
++        const VkMemoryBarrier after{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
++                             VK_ACCESS_MEMORY_WRITE_BIT,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
++                               after);
++    });
++    pending_bytes += size;
++    readbacks.push_back({.buffer = std::move(buffer),
++                         .target = {},
++                         .name = {},
++                         .tags = std::move(tags),
++                         .raw = true,
++                         .bytes = size});
++    return true;
++}
++
+ void FrameDump::DrainIfFull() {
+     if (pending_bytes >= STAGING_BUDGET) {
+         Drain();
+@@ -546,12 +686,14 @@ void FrameDump::Drain() {
+     for (Readback& readback : readbacks) {
+         readback.buffer.Invalidate();
+         const Target& target = readback.target;
+-        const auto mapped = readback.buffer.Mapped().first(size_t{target.width} * target.height *
+-                                                           target.depth * TexelBytes(target));
++        const auto mapped = readback.buffer.Mapped().first(
++            readback.raw ? readback.bytes
++                         : size_t{target.width} * target.height * target.depth * TexelBytes(target));
+         Enqueue({.target = target,
+                  .name = std::move(readback.name),
+                  .tags = std::move(readback.tags),
+-                 .data = {mapped.begin(), mapped.end()}});
++                 .data = {mapped.begin(), mapped.end()},
++                 .raw = readback.raw});
+     }
+     readbacks.clear();
+     pending_bytes = 0;
+@@ -592,7 +734,9 @@ void FrameDump::WriterLoop() {
+             }
+             continue;
+         }
+-        if (job.name.empty()) {
++        if (job.raw) {
++            WriteBuffer(job);
++        } else if (job.name.empty()) {
+             manifest << job.tags << '\n';
+         } else {
+             Write(job);
+@@ -684,6 +828,18 @@ void FrameDump::Write(const Job& job) {
+              << '\n';
+ }
+ 
++void FrameDump::WriteBuffer(const Job& job) {
++    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(job.data.data()),
++                                        job.data.size());
++    const std::string name = fmt::format("buffer_{:016x}.bin.zst", hash);
++    if (std::ranges::find(written_buffers, hash) == written_buffers.end()) {
++        written_buffers.push_back(hash);
++        WriteFile(name, Common::Compression::CompressDataZSTDDefault(job.data.data(),
++                                                                     job.data.size()));
++    }
++    manifest << fmt::format(R"({{{},"hash":"{:016x}","raw":"{}"}})", job.tags, hash, name) << '\n';
++}
++
+ void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
+     std::ofstream file{directory / name, std::ios::binary};
+     file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+@@ -724,13 +880,14 @@ void FrameDump::TickFrame() {
+              << '\n';
+     writer = std::thread{[this] { WriterLoop(); }};
+     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,
+-             elapsed, schedule.Sampled() ? " with sampled textures" : "", directory.string());
++             elapsed, schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures") : (schedule.Buffers() ? " with buffers" : ""), directory.string());
+ }
+ 
+ void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path trigger_file_,
+                                   bool sampled_) {
+     enabled = true;
+     sampled = sampled_;
++    buffers = sampled_;
+     if (at == "file") {
+         trigger_file = std::move(trigger_file_);
+     } else if (at.ends_with('f')) {
+@@ -740,13 +897,14 @@ void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path tri
+     }
+ }
+ 
+-bool FrameDumpSchedule::Arm(bool sampled_, u64 id) {
++bool FrameDumpSchedule::Arm(bool sampled_, bool buffers_, u64 id) {
+     if (capturing) {
+         return false;
+     }
+     enabled = true;
+     done = false;
+     sampled = sampled_;
++    buffers = buffers_;
+     trigger_frame = 0;
+     capture_id = id;
+     return true;
+diff --git a/src/video_core/renderer_vulkan/vk_frame_dump.h b/src/video_core/renderer_vulkan/vk_frame_dump.h
+index 3d0ded5ca7..01de43db2f 100644
+--- a/src/video_core/renderer_vulkan/vk_frame_dump.h
++++ b/src/video_core/renderer_vulkan/vk_frame_dump.h
+@@ -27,6 +27,7 @@ namespace Vulkan {
+ class Device;
+ class ImageView;
+ class MemoryAllocator;
++class Sampler;
+ class Scheduler;
+ 
+ /// When FrameDump captures, and whether it reads the sampled textures back. Kept apart from the
+@@ -36,11 +37,12 @@ public:
+     enum class Step { None, Start, Finish };
+ 
+     /// EDEN_NX2_FRAME_DUMP_AT: seconds after boot ("45"), a frame number ("2700f"), or "file" to
+-    /// capture once `trigger_file` exists.
++    /// capture once `trigger_file` exists. EDEN_NX2_FRAME_DUMP_SAMPLED reads back both the
++    /// sampled textures and the bound buffers.
+     void Configure(std::string_view at, std::filesystem::path trigger_file, bool sampled);
+     /// Captures the next frame for the debug server, which is told `id`. False while a capture
+     /// runs.
+-    bool Arm(bool sampled, u64 id);
++    bool Arm(bool sampled, bool buffers, u64 id);
+     /// Once per presented frame: whether a capture starts with the next frame or has ended.
+     Step Tick(double elapsed_seconds);
+     /// The capture Tick started could not begin.
+@@ -52,6 +54,10 @@ public:
+     [[nodiscard]] bool Sampled() const noexcept {
+         return sampled;
+     }
++    /// Whether the uniform and storage buffers and dispatch group counts are recorded.
++    [[nodiscard]] bool Buffers() const noexcept {
++        return buffers;
++    }
+     [[nodiscard]] u64 Frame() const noexcept {
+         return frame;
+     }
+@@ -65,6 +71,7 @@ private:
+ 
+     bool enabled{};
+     bool sampled{};
++    bool buffers{};
+     bool capturing{};
+     bool done{};
+     std::filesystem::path trigger_file;
+@@ -83,14 +90,34 @@ private:
+ /// the frame, in seconds after boot ("45") or as a frame number ("2700f").
+ /// EDEN_NX2_FRAME_DUMP_SAMPLED=1 also reads back every texture a pass samples (3D and depth
+ /// included), once per pass, as the first draw sampling it sees it, and the textures each compute
+-/// shader samples, once per shader, before its first dispatch. Readbacks are encoded and written on
+-/// a worker thread so the capture does not stall the game.
++/// shader samples, once per shader, before its first dispatch, with each texture's sampler state,
++/// and the uniform and storage buffers of every draw and dispatch, once per shader and binding, with
++/// each dispatch's group counts. Readbacks are encoded and written on a worker thread so the
++/// capture does not stall the game.
+ class FrameDump {
+ public:
+     struct Sampled {
+         u32 stage;
+         u32 tic;
+         ImageView* view;
++        const Sampler* sampler;
++    };
++
++    /// A uniform or storage buffer binding. Its bytes come from guest memory, or from the host
++    /// buffer when the GPU wrote the range and guest memory may be stale.
++    struct BoundBuffer {
++        u32 stage;
++        bool storage;
++        u32 index;
++        bool written;
++        GPUVAddr gpu_addr;
++        u64 device_addr;
++        u32 bound_size;
++        u32 size;
++        bool gpu_modified;
++        VkBuffer host;
++        u32 host_offset;
++        std::vector<u8> guest;
+     };
+ 
+     explicit FrameDump(const Device& device, MemoryAllocator& memory_allocator,
+@@ -105,11 +132,23 @@ public:
+         return schedule.Capturing() && schedule.Sampled();
+     }
+ 
++    [[nodiscard]] bool CapturingBuffers() const noexcept {
++        return schedule.Capturing() && schedule.Buffers();
++    }
++
+     /// Reads back the textures of the current draw not yet seen in this pass. Returns true when
+     /// copies were recorded, which ends the current render pass.
+     bool NoteSampled(std::span<const Sampled> textures);
+     /// Reads back the textures of the dispatch about to run not yet seen for this shader.
+     void NoteDispatchSampled(u64 shader_hash, std::span<const Sampled> textures);
++    /// Records the buffers of the current draw (shader hashes by program) or of the dispatch about
++    /// to run not yet seen for their shader. Returns true when copies were recorded.
++    bool NoteBuffers(bool compute, std::span<const u64> shader_hashes,
++                     std::span<BoundBuffer> buffers);
++    /// Records the group counts of the dispatch about to run.
++    void NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
++                    const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,
++                    std::optional<std::array<u32, 3>> indirect_grid);
+ 
+     /// Starts a pass when the framebuffer changes and captures the previous one.
+     /// Returns true when copies were recorded, which ends the current render pass.
+@@ -124,7 +163,7 @@ public:
+     void TickFrame();
+     /// Captures the next frame into `directory` for the debug server, which is told `id` once
+     /// the manifest is complete. Works without EDEN_NX2_FRAME_DUMP.
+-    void Arm(std::filesystem::path directory, bool sampled, u64 id);
++    void Arm(std::filesystem::path directory, bool sampled, bool buffers, u64 id);
+ 
+ private:
+     enum class DepthEncoding { None, Unorm16, Unorm24, Float32 };
+@@ -144,19 +183,24 @@ private:
+         DepthEncoding depth_encoding;
+     };
+ 
++    /// An image readback, or a buffer one (`raw`) of `bytes` bytes.
+     struct Readback {
+         vk::Buffer buffer;
+         Target target;
+         std::string name;
+         std::string tags;
++        bool raw{};
++        size_t bytes{};
+     };
+ 
+-    /// Work for the writer thread: a readback (`name` set), a finished manifest line, or the summary.
++    /// Work for the writer thread: an image readback (`name` set), buffer bytes (`raw`), a
++    /// finished manifest line, or the summary.
+     struct Job {
+         Target target{};
+         std::string name;
+         std::string tags;
+         std::vector<u8> data;
++        bool raw{};
+         bool summary{};
+         bool truncated{};
+     };
+@@ -166,10 +210,12 @@ private:
+     static int Decode(const Target& target, const u8* pixel, std::array<float, 4>& out);
+     bool Record(const Target& target, std::string name, std::string tags);
+     bool RecordSampled(const Sampled& texture, u32 index, std::string name, std::string tags);
++    bool RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags);
+     void Drain();
+     void Enqueue(Job job);
+     void WriterLoop();
+     void Write(const Job& job);
++    void WriteBuffer(const Job& job);
+     void WriteFile(const std::string& name, std::span<const u8> data);
+     void StopWriter();
+ 
+@@ -196,6 +242,10 @@ private:
+     std::vector<std::pair<GPUVAddr, u32>> pass_sampled;
+     /// (compute shader hash, image address, format/level/layer) already read back this frame.
+     std::vector<std::tuple<u64, GPUVAddr, u32>> dispatch_sampled;
++    /// (shader hash, storage, binding index, device address, size) already recorded this frame.
++    std::vector<std::tuple<u64, bool, u32, u64, u32>> seen_buffers;
++    /// Content hashes of the buffer files written; writer thread only.
++    std::vector<u64> written_buffers;
+     u32 pass_index{};
+     u32 pass_first_draw{};
+     u32 draws{};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 68f924cfeb..ffe0c09c22 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -522,6 +522,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     if (RecordingSampledTextures()) {
+         sampled_images.clear();
+         size_t view_index{};
++        size_t sampler_index{};
+         for (size_t stage = 0; stage < Spec::enabled_stages.size(); ++stage) {
+             if (!Spec::enabled_stages[stage]) {
+                 continue;
+@@ -534,9 +535,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+                 view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
+             }
+             const u32 textures = Shader::NumDescriptors(info.texture_descriptors);
+-            for (u32 texture = 0; texture < textures; ++texture, ++view_index) {
+-                sampled_images.push_back(
+-                    {static_cast<u32>(stage), views[view_index].index, views[view_index].id});
++            for (u32 texture = 0; texture < textures; ++texture, ++view_index, ++sampler_index) {
++                sampled_images.push_back({static_cast<u32>(stage), views[view_index].index,
++                                          views[view_index].id, samplers[sampler_index]});
+             }
+             if constexpr (Spec::has_images) {
+                 view_index += Shader::NumDescriptors(info.image_descriptors);
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index f8b8cd96bf..ec12bce2ea 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -97,6 +97,7 @@ public:
+         u32 stage;
+         u32 tic;
+         VideoCommon::ImageViewId id;
++        VideoCommon::SamplerId sampler;
+     };
+ 
+     /// The sampled textures of the last configured draw, kept while a sampled frame dump runs.
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index fe75fae096..0d31638e01 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -439,14 +439,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
+     if (frame_dump.Capturing()) {
+         FrameDumpPass(texture_cache.GetFramebuffer());
+         frame_dump.NoteDraw(pipeline->ShaderHashes());
++        bool recorded = false;
+         if (frame_dump.CapturingSampled()) {
+             boost::container::small_vector<FrameDump::Sampled, 16> sampled;
+             for (const auto& image : pipeline->SampledImages()) {
+-                sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id)});
+-            }
+-            if (frame_dump.NoteSampled(sampled)) {
+-                scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
++                sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id),
++                                   &texture_cache.GetSampler(image.sampler)});
+             }
++            recorded = frame_dump.NoteSampled(sampled);
++        }
++        if (frame_dump.CapturingBuffers()) {
++            recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
++        }
++        if (recorded) {
++            scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+         }
+     }
+     if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
+@@ -1358,13 +1364,29 @@ void RasterizerVulkan::DispatchCompute() {
+     if (frame_dump.CapturingSampled()) {
+         boost::container::small_vector<FrameDump::Sampled, 16> sampled;
+         for (const auto& image : pipeline->SampledImages()) {
+-            sampled.push_back({5, image.tic, &texture_cache.GetImageView(image.id)});
++            sampled.push_back({5, image.tic, &texture_cache.GetImageView(image.id),
++                               &texture_cache.GetSampler(image.sampler)});
+         }
+         frame_dump.NoteDispatchSampled(pipeline->ShaderHash(), sampled);
+     }
++    if (frame_dump.CapturingBuffers()) {
++        FrameDumpBuffers(true, std::array{pipeline->ShaderHash()});
++    }
+ 
+     const auto& qmd{kepler_compute->launch_description};
+     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
++    if (frame_dump.CapturingBuffers()) {
++        std::optional<std::array<u32, 3>> indirect_grid;
++        if (indirect_address) {
++            indirect_grid = std::array{gpu_memory->Read<u32>(*indirect_address),
++                                       gpu_memory->Read<u32>(*indirect_address + 4),
++                                       gpu_memory->Read<u32>(*indirect_address + 8)};
++        }
++        frame_dump.NoteLaunch(pipeline->ShaderHash(),
++                              {qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z},
++                              {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
++                              indirect_address, indirect_grid);
++    }
+     if (indirect_address) {
+         // DispatchIndirect
+         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
+@@ -1852,6 +1874,36 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64>
+     });
+ }
+ 
++bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
++    static constexpr u32 BUFFER_CAP = 4U << 20;
++    std::vector<FrameDump::BoundBuffer> buffers;
++    buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
++                                                 const auto& binding, u32 bound_size,
++                                                 const auto* host, u32 host_offset) {
++        const u32 size = std::min(bound_size, BUFFER_CAP);
++        const bool gpu_modified = buffer_cache.IsRegionGpuModified(binding.device_addr, size);
++        FrameDump::BoundBuffer& buffer = buffers.emplace_back(FrameDump::BoundBuffer{
++            .stage = stage,
++            .storage = storage,
++            .index = index,
++            .written = written,
++            .gpu_addr = binding.gpu_addr,
++            .device_addr = binding.device_addr,
++            .bound_size = bound_size,
++            .size = size,
++            .gpu_modified = gpu_modified,
++            .host = host ? host->Handle() : VK_NULL_HANDLE,
++            .host_offset = host_offset,
++            .guest = {},
++        });
++        if (!gpu_modified || !host) {
++            buffer.guest.resize(size);
++            device_memory.ReadBlockUnsafe(binding.device_addr, buffer.guest.data(), size);
++        }
++    });
++    return frame_dump.NoteBuffers(compute, shader_hashes, buffers);
++}
++
+ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
+     std::array<ImageView*, VideoCommon::NUM_RT> colors{};
+     const auto& ids = texture_cache.GetRenderTargets().color_buffer_ids;
+@@ -1868,7 +1920,8 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
+ void RasterizerVulkan::TickFrame() {
+     if (VideoCore::Nx2Debug::HasRequests()) {
+         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
+-            frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->id);
++            frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
++                           capture->id);
+         }
+         if (const auto change = VideoCore::Nx2Debug::TakeRejectChange()) {
+             pipeline_cache.RefreshDebugRejections(change->unrejected);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index dd601cff30..29a150d821 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -235,6 +235,8 @@ private:
+     void FrameDumpPass(const Framebuffer* framebuffer);
+     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
+     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
++    /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
++    bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
+ 
+     Tegra::GPU& gpu;
+     Tegra::MaxwellDeviceMemoryManager& device_memory;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index bc9f3bafb5..65f84789f4 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -4493,6 +4493,7 @@ void CustomBorderColorBudget::Release() noexcept {
+ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& tsc) {
+     const auto& device = runtime.device;
+     device_ptr = &device;
++    descriptor = tsc;
+     border_color = tsc.BorderColor();
+     srgb_border_color = tsc.SrgbBorderColor();
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 069bec7704..49dd837a42 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -823,6 +823,15 @@ public:
+ 
+     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
+ 
++    /// The guest descriptor and the host state built from it, for EDEN_NX2_FRAME_DUMP_SAMPLED.
++    [[nodiscard]] const Tegra::Texture::TSCEntry& Descriptor() const noexcept {
++        return descriptor;
++    }
++
++    [[nodiscard]] const VkSamplerCreateInfo& CreateInfo() const noexcept {
++        return base_ci;
++    }
++
+ private:
+     struct VariantKey {
+         bool reduce_anisotropy;
+@@ -854,6 +863,7 @@ private:
+     std::vector<Variant> variants;
+ 
+     const Device* device_ptr{nullptr};
++    Tegra::Texture::TSCEntry descriptor{};
+     VkSamplerCreateInfo base_ci{};
+     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};
+     std::array<float, 4> border_color{};
+diff --git a/tools/nx2/debug_mcp.py b/tools/nx2/debug_mcp.py
+index 4c7c65f37c..51fd00b62a 100644
+--- a/tools/nx2/debug_mcp.py
++++ b/tools/nx2/debug_mcp.py
+@@ -75,13 +75,17 @@ TOOLS = [
+         "name": "capture_frame",
+         "description": "EDEN_NX2_FRAME_DUMP for the next frame, now: every pass colour target, "
+                        "dispatch storage image and the present source as PNG and .raw.zst, plus "
+-                       "manifest.jsonl. 'sampled' also reads back every sampled texture. Returns "
++                       "manifest.jsonl. 'sampled' also reads back every sampled texture with its "
++                       "sampler state; 'buffers' records every draw's and dispatch's uniform and "
++                       "storage buffers (kind: buffer, buffer_<hash>.bin.zst) and dispatch group "
++                       "counts (kind: launch). Returns "
+                        "the directory, summary, entry counts and the first manifest entries. "
+                        "'index' builds index.html with frame_dump_index.py.",
+         "inputSchema": {
+             "type": "object",
+             "properties": {
+                 "sampled": {"type": "boolean"},
++                "buffers": {"type": "boolean"},
+                 "timeout_s": {"type": "integer", "minimum": 1, "maximum": 600},
+                 "manifest_lines": {"type": "integer", "minimum": 0, "maximum": 5000},
+                 "index": {"type": "boolean"},
+diff --git a/tools/nx2/frame_dump_index.py b/tools/nx2/frame_dump_index.py
+index d3996aa7f5..15b74d2b47 100644
+--- a/tools/nx2/frame_dump_index.py
++++ b/tools/nx2/frame_dump_index.py
+@@ -90,6 +90,8 @@ def main():
+             header = entry
+         elif entry.get("kind") == "summary":
+             summary = entry
++        elif entry.get("kind") in ("buffer", "launch"):
++            continue
+         else:
+             entries.append(entry)
+     info = (f"frame {header.get('frame', '?')} at {header.get('seconds', '?')} s · "
