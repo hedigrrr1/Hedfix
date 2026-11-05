@@ -54,10 +54,10 @@ TEST_CASE("Ampere indexed ULDC of bytes and halfwords lowers to an indexed Maxwe
           "[video_core][ampere][oot]") {
     // ULDC.U8 / ULDC.U16 UR, c[bank][UR + offset] from Ocarina's compute programs.
     const std::array<std::pair<Instruction, u64>, 4> captured{{
-        {{{0x06087abb, 0x01002080, 0x08000000, 0x000fe400}}, 0xef9000400820dee0ULL},
-        {{{0x06077abb, 0x01002080, 0x08000000, 0x000fe400}}, 0xef9000400820dedfULL},
-        {{{0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400}}, 0xef9000500030e5dcULL},
-        {{{0x11047abb, 0x01400000, 0x08000400, 0x000fe400}}, 0xef9200500000e9dcULL},
+        {{{0x06087abb, 0x01002080, 0x08000000, 0x000fe400}}, 0xef9000400827dee0ULL},
+        {{{0x06077abb, 0x01002080, 0x08000000, 0x000fe400}}, 0xef9000400827dedfULL},
+        {{{0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400}}, 0xef9000500037e5dcULL},
+        {{{0x11047abb, 0x01400000, 0x08000400, 0x000fe400}}, 0xef9200500007e9dcULL},
     }};
     for (const auto& [uldc, ldc] : captured) {
         const auto lowered = LowerToMaxwell(std::array{uldc, Exit});

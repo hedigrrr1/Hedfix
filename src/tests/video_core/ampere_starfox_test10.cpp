@@ -327,10 +327,11 @@ TEST_CASE("Star Fox ULDC U16 rejects unrepresentable offsets and unsupported mod
         CHECK_FALSE(lowered);
         CHECK(lowered.instructions.empty());
     }
+    // The indexed form loads halfwords too (Ocarina of Time's compute programs).
     auto indexed = CapturedUniformLoad;
     SetBits(indexed, 0, 12, 0xabb);
     SetBits(indexed, 91, 1, 1);
-    CHECK_FALSE(LowerToMaxwell(std::array{indexed, Exit}));
+    CHECK(LowerToMaxwell(std::array{indexed, Exit}));
 }
 
 TEST_CASE("Star Fox Test10 uniform U16 conversion reaches the real translator",
