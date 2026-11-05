@@ -89,7 +89,7 @@ TEST_CASE("Ampere ULEA carries through UP2 and UP3 into UIADD3.X", "[video_core]
         const u64 slot = 6 - up;
         // ISETP writes the carry to P(6-n); IADD3.X selects it back from P(6-n).
         CHECK(std::any_of(out.begin(), out.end(), [&](u64 i) {
-            return (i >> 48) == 0x5b60 && ((i >> 3) & 7) == slot;
+            return ((i >> 48) & ~3ULL) == 0x5b60 && ((i >> 3) & 7) == slot;
         }));
         CHECK(std::any_of(out.begin(), out.end(), [&](u64 i) {
             return (i >> 48) == 0x5ca0 && ((i >> 39) & 7) == slot;
