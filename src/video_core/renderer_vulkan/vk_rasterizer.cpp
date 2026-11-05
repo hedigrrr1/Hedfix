@@ -722,6 +722,25 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
         if (std::find(skip_list.begin(), skip_list.end(), vs) != skip_list.end()) return;
     }
+    // EDEN_NX2_TRACE_DST=<hex>: also log draws whose depth target lies within 32 MiB above it
+    // (as the DMA and 2D engines do for their copies).
+    if (static const u64 trace_destination = [] {
+            const char* value = std::getenv("EDEN_NX2_TRACE_DST");
+            return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
+        }();
+        trace_destination != 0 && maxwell3d->regs.zeta_enable) {
+        const auto& regs = maxwell3d->regs;
+        const GPUVAddr zeta = regs.zeta.Address();
+        if (zeta >= trace_destination && zeta < trace_destination + (32ULL << 20)) {
+            static std::set<std::tuple<GPUVAddr, u64, u64>> seen;
+            const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+            const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+            if (seen.size() < 64 && seen.emplace(zeta, vs, ps).second) {
+                LOG_INFO(HW_GPU, "nx2 draw to traced depth: {:#x} format={:#x} vs={:#x} ps={:#x} rt0={:#x}",
+                         zeta, static_cast<u32>(regs.zeta.format), vs, ps, regs.rt[0].Address());
+            }
+        }
+    }
     // EDEN_NX2_RT_TRACE: log the first draw to every distinct colour target (debug aid).
     if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {
         static std::set<std::tuple<GPUVAddr, u32, u32, u64, u64>> seen;
@@ -1801,12 +1820,17 @@ void RasterizerVulkan::TraceRenderState(bool is_indexed, const char* outcome,
 }
 
 void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
-    std::array<ImageView*, VideoCommon::NUM_RT> colors{};
-    const auto& ids = texture_cache.GetRenderTargets().color_buffer_ids;
+    // Slots 0-7 are the colour targets, slot 8 the depth-stencil target.
+    std::array<ImageView*, VideoCommon::NUM_RT + 1> colors{};
+    const auto& render_targets = texture_cache.GetRenderTargets();
+    const auto& ids = render_targets.color_buffer_ids;
     for (size_t slot = 0; slot < ids.size(); ++slot) {
         if (ids[slot]) {
             colors[slot] = &texture_cache.GetImageView(ids[slot]);
         }
+    }
+    if (render_targets.depth_buffer_id) {
+        colors[VideoCommon::NUM_RT] = &texture_cache.GetImageView(render_targets.depth_buffer_id);
     }
     if (frame_dump.BeginPass(framebuffer, colors)) {
         scheduler.RequestRenderpass(framebuffer);
