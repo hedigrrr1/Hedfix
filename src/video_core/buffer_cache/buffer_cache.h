@@ -9,6 +9,8 @@
 #include "video_core/buffer_cache/uniform_cache_history.h"
 
 #include <algorithm>
+#include <set>
+#include <tuple>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -585,9 +587,24 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
 
     const auto& cbufs = maxwell3d->state.shader_stages[stage];
     const GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
-    channel_state->storage_buffers[stage][ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
-    return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
+    // EDEN_NX2_GRAPHICS_SSBO_MAPPED=1: size native graphics bindings from the mapping, as native
+    // compute bindings are, instead of taking the word after the pointer as an NVN size.
+    static const bool mapped_size = std::getenv("EDEN_NX2_GRAPHICS_SSBO_MAPPED") != nullptr;
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    auto& binding = channel_state->storage_buffers[stage][ssbo_index];
+    binding = StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native && mapped_size);
+    if (native) {
+        static std::set<std::tuple<size_t, u32, u32, u32>> logged;
+        const u32 next_word = gpu_memory->Read<u32>(ssbo_addr + 8);
+        if (logged.size() < 64 && logged.emplace(stage, cbuf_index, cbuf_offset, binding.size).second) {
+            LOG_INFO(HW_GPU,
+                     "Native graphics storage buffer: stage {} cbuf {} +{:#x} -> {:#x}, bound {:#x} "
+                     "bytes (next word {:#x}, mapping {:#x})",
+                     stage, cbuf_index, cbuf_offset, gpu_memory->Read<u64>(ssbo_addr), binding.size,
+                     next_word, gpu_memory->GetMemoryLayoutSize(gpu_memory->Read<u64>(ssbo_addr)));
+        }
+    }
+    return (binding.buffer_id != NULL_BUFFER_ID);
 }
 
 template <class P>

@@ -57,6 +57,7 @@ Use these before guessing. All are off unless the variable is set; pass them as 
 | Split GPU thread races | `EDEN_NX2_SPLIT_CHECK=1` | Reports scheduler use from the wrong thread. |
 | Upscaler and DLSS contracts | `EDEN_NX2_DLSS_CONTRACT_TRACE=1` | Inputs and outputs of replaced upscaler networks. |
 | Who writes an image (draws, DMA copies, 2D blits) | `EDEN_NX2_TRACE_DST=<hex GPU address>` | Logs DMA copies, 2D blits and draws whose depth target land within 32 MiB above that address. |
+| Objects drawn by native graphics programs (task/mesh included) missing or partial | `EDEN_NX2_GRAPHICS_SSBO_MAPPED=1` | Native graphics storage buffers are sized from the mapping instead of the word after the pointer; the log lists each binding (`Native graphics storage buffer: ...`) either way. |
 | Service calls | `EDEN_NX2_IPC_TRACE=1` | IPC command trace. |
 | Host crash (log just stops) | Windows minidump in `%LOCALAPPDATA%\CrashDumps\lichii.exe.<pid>.dmp` | Read the exception and stack with the `minidump` Python package, then symbolize with `llvm-symbolizer --obj=lichii.exe --inlines --relative-address <offset>` next to the build's `lichii.pdb`. |
 
