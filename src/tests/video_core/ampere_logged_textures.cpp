@@ -291,7 +291,8 @@ TEST_CASE("Welcome Tour logged half gathers round and pack both destination orde
 
 TEST_CASE("Logged half textures retain unsupported-mode rejections",
           "[video_core][ampere][logged_textures]") {
-    for (const u32 bit : {76U, 77U, 78U, 80U, 91U}) {
+    // Bit 77 alone selects per-tap offsets, which half gathers support.
+    for (const u32 bit : {76U, 78U, 80U, 91U}) {
         auto invalid{Gathers[0]};
         invalid.words[bit / 32] ^= 1U << (bit % 32);
         CHECK_FALSE(Shader::Ampere::LowerToMaxwell(std::array{invalid, Exit}));

@@ -77,4 +77,13 @@ TEST_CASE("Yoshi captured SURED uses a buffer coordinate and descriptor", "[ampe
     auto unsupported = Reduction;
     unsupported.words[2] |= 0x200;
     REQUIRE_FALSE(LowerToMaxwell(std::array{unsupported, Exit}));
+    // Bits 87-89 select ADD..XOR (Ocarina uses OR), the same order as Maxwell SURED's bits 24-26.
+    for (u32 operation = 0; operation < 8; ++operation) {
+        auto instruction = Reduction;
+        instruction.words[2] |= operation << 23;
+        const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        CHECK(((lowered.instructions[0] >> 24) & 7) == operation);
+    }
 }

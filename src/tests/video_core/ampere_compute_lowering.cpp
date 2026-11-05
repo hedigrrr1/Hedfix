@@ -32,6 +32,23 @@ TEST_CASE("Ampere LEA.HI with a constant base still rejects a carry out", "[vide
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
 }
 
+TEST_CASE("Ampere LEA.HI with a negated register base lowers to IADD with a negated B",
+          "[video_core][ampere][oot]") {
+    // LEA.HI R1, R1, -R0, RZ, 0x1e from Ocarina's per-tap gather compute program.
+    const Instruction lea{{0x01017211, 0x80000000, 0x078ff0ff, 0x000fca00}};
+    const auto lowered = LowerToMaxwell(std::array{lea, Exit});
+    INFO(lowered.error);
+    REQUIRE(static_cast<bool>(lowered));
+    const auto& out = lowered.instructions;
+    // R250 = R1 >> 2 (32 - 0x1e, unsigned), then R1 = R250 - R0.
+    REQUIRE(std::find(out.begin(), out.end(), 0x38280000002701faULL) != out.end());
+    REQUIRE(std::find(out.begin(), out.end(), 0x5c1100000007fa01ULL) != out.end());
+    // A negated base with a carry in (.X) has no lowering.
+    auto extended = lea;
+    extended.words[2] |= 1U << 10;
+    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(std::array{extended, Exit})));
+}
+
 TEST_CASE("Ampere LEA with a constant base and no carry out lowers to ISCADD", "[video_core][ampere]") {
     // LEA R0, R0, c[0][0x2e0]-style constant, 0x8 from Pokemon Pokopia's album compute shaders.
     const std::array<Instruction, 2> code{{{{0x00007a11, 0x01002e00, 0x078e40ff, 0x000fe200}}, Exit}};
