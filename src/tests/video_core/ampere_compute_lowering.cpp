@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <utility>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
 
@@ -47,6 +48,28 @@ TEST_CASE("Ampere LEA.HI with a negated register base lowers to IADD with a nega
     auto extended = lea;
     extended.words[2] |= 1U << 10;
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(std::array{extended, Exit})));
+}
+
+TEST_CASE("Ampere indexed ULDC of bytes and halfwords lowers to an indexed Maxwell LDC",
+          "[video_core][ampere][oot]") {
+    // ULDC.U8 / ULDC.U16 UR, c[bank][UR + offset] from Ocarina's compute programs.
+    const std::array<std::pair<Instruction, u64>, 4> captured{{
+        {{{0x06087abb, 0x01002080, 0x08000000, 0x000fe400}}, 0xef9000400820dee0ULL},
+        {{{0x06077abb, 0x01002080, 0x08000000, 0x000fe400}}, 0xef9000400820dedfULL},
+        {{{0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400}}, 0xef9000500030e5dcULL},
+        {{{0x11047abb, 0x01400000, 0x08000400, 0x000fe400}}, 0xef9200500000e9dcULL},
+    }};
+    for (const auto& [uldc, ldc] : captured) {
+        const auto lowered = LowerToMaxwell(std::array{uldc, Exit});
+        INFO(lowered.error);
+        REQUIRE(static_cast<bool>(lowered));
+        const auto& out = lowered.instructions;
+        CHECK(std::find(out.begin(), out.end(), ldc) != out.end());
+    }
+    // A halfword at an odd offset has no LDC form.
+    auto odd = captured[3].first;
+    odd.words[1] |= 1U << 6;
+    CHECK_FALSE(static_cast<bool>(LowerToMaxwell(std::array{odd, Exit})));
 }
 
 TEST_CASE("Ampere LEA with a constant base and no carry out lowers to ISCADD", "[video_core][ampere]") {

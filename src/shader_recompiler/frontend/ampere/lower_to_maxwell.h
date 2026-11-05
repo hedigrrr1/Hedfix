@@ -1129,9 +1129,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0xab9: case 0xabb: { // ULDC, direct or indexed.
             const u32 uniform_dest = insn.Bits(16, 8), index_reg = insn.Bits(24, 8);
             const u32 width = insn.Bits(73, 3);
-            const bool subword_load = opcode == 0xab9 && (width == 0 || width == 2);
+            // Indexed loads take any byte or halfword size: Maxwell LDC has the same sizes.
+            const bool subword_load = opcode == 0xab9 ? width == 0 || width == 2 : width < 4;
             const u32 offset = insn.Bits(38, 16);
-            const u32 alignment = width == 0 ? 1U : width == 2 ? 2U : 4U;
+            const u32 alignment = width < 2 ? 1U : width < 4 ? 2U : 4U;
             const u32 target = uniform_register(uniform_dest);
             const u32 index_target = opcode == 0xabb ? uniform_register(index_reg) : 255U;
             if (target == ~0U || target == 255 || (!subword_load && width != 4 && width != 5) ||
