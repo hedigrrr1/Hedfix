@@ -894,7 +894,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (!vertex_binding_divisors.empty()) {
         vertex_input_ci.pNext = &input_divisor_ci;
     }
-    const bool has_tess_stages = spv_modules[1] || spv_modules[2];
+    // Mesh programs sit in the tessellation slots; they are not tessellation stages.
+    const bool has_tess_stages = (spv_modules[1] && !stage_infos[1].is_mesh) ||
+                                 (spv_modules[2] && !stage_infos[2].is_mesh);
     // EDEN_NX2_DROP_TESS: when the game's topology is not a patch list, drop the tessellation
     // stages instead of rewriting the topology (to A/B what those draws should look like).
     static const bool drop_tess_env = std::getenv("EDEN_NX2_DROP_TESS") != nullptr;
