@@ -304,3 +304,14 @@ TEST_CASE("Failed Phi handle subtrees discard their cached values",
         }
     }
 }
+
+TEST_CASE("A handle in a word of a 128-bit storage load is computed per draw",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    const Value record{shader.Emit(Opcode::LoadStorage128, {Value{0U}, Value{0U}})};
+    auto& sample{shader.Sample(shader.Emit(Opcode::CompositeExtractU32x4, {record, Value{1U}}))};
+    shader.Run();
+
+    REQUIRE(shader.program.info.handle_programs.size() == 1);
+    CHECK(shader.Evaluate(sample, 0x1234, 0x50) == 0x50);
+}

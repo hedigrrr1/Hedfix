@@ -13,6 +13,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
@@ -894,6 +895,10 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         vertex_input_ci.pNext = &input_divisor_ci;
     }
     const bool has_tess_stages = spv_modules[1] || spv_modules[2];
+    // EDEN_NX2_DROP_TESS: when the game's topology is not a patch list, drop the tessellation
+    // stages instead of rewriting the topology (to A/B what those draws should look like).
+    static const bool drop_tess_env = std::getenv("EDEN_NX2_DROP_TESS") != nullptr;
+    bool drop_tess_stages = false;
     auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
     if (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
         if (!has_tess_stages) {
@@ -902,11 +907,21 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         }
     } else {
         if (has_tess_stages) {
-            // The Vulkan spec requires patch list IA topology be used with tessellation
-            // shader stages. Forcing it fixes a crash on some drivers
             LOG_WARNING(Render_Vulkan,
-                        "Patch topology not used with tessellation, using patch list");
-            input_assembly_topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+                        "Patch topology not used with tessellation (topology {}, patch control "
+                        "points {}, tcs={} tes={}, hashes {:016x}), {}",
+                        static_cast<u32>(key.state.topology.Value()),
+                        key.state.patch_control_points_minus_one.Value() + 1,
+                        spv_modules[1] ? 1 : 0, spv_modules[2] ? 1 : 0,
+                        fmt::join(key.unique_hashes, ","),
+                        drop_tess_env ? "dropping the tessellation stages" : "using patch list");
+            if (drop_tess_env) {
+                drop_tess_stages = true;
+            } else {
+                // The Vulkan spec requires patch list IA topology be used with tessellation
+                // shader stages. Forcing it fixes a crash on some drivers
+                input_assembly_topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+            }
         }
     }
     const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci{
@@ -1219,13 +1234,18 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         if (!spv_modules[stage]) {
             continue;
         }
+        const VkShaderStageFlagBits stage_flag =
+            StageFlag(stage_infos[stage], MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)));
+        if (drop_tess_stages && (stage_flag == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT ||
+                                 stage_flag == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) {
+            continue;
+        }
         [[maybe_unused]] auto& stage_ci =
             shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .pNext = nullptr,
                 .flags = 0,
-                .stage = StageFlag(stage_infos[stage],
-                                   MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
+                .stage = stage_flag,
                 .module = *spv_modules[stage],
                 .pName = "main",
                 .pSpecializationInfo = nullptr,

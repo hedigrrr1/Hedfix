@@ -580,7 +580,10 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
     case IR::Opcode::GetCbufU32:
     case IR::Opcode::LoadStorage32:
         return load_word(inst, 0);
-    case IR::Opcode::CompositeExtractU32x2: {
+    case IR::Opcode::CompositeExtractU32x2:
+    case IR::Opcode::CompositeExtractU32x3:
+    case IR::Opcode::CompositeExtractU32x4: {
+        // A word of a 64- to 128-bit load (a handle in a material record read with LDG.128).
         const IR::Value element{inst->Arg(1)};
         if (!element.IsImmediate() || inst->Arg(0).IsImmediate()) return false;
         return load_word(inst->Arg(0).InstRecursive(), element.U32() * 4);
