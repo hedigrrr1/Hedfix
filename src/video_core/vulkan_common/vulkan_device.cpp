@@ -1530,7 +1530,8 @@ void Device::RemoveUnsuitableExtensions() {
                                        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
 
     // VK_EXT_robustness2
-    features.robustness2.robustBufferAccess2 = VK_FALSE;
+    // Keep robustBufferAccess2: games read storage buffers out of bounds and expect zeros
+    // (Ocarina's fog light compute 75d4369f3b1f5868 filled distant froxels with large values).
     features.robustness2.robustImageAccess2 = VK_FALSE;
     extensions.robustness_2 = features.robustness2.nullDescriptor;
 
