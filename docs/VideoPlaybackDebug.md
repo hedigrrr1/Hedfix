@@ -68,3 +68,27 @@ the existing MSVC/Linux AV1 package selection does not establish MinGW support.
 Unset all trace/capture variables after testing. `EDEN_NX2_VDEC_TRACE` is enabled
 by presence, so setting it to `0` does not disable it. Restart after changing
 environment variables because the emulator caches them.
+
+## Ocarina of Time: how the movie player keeps time
+
+Read from the game's code (main, movie player around `0x3b5c000`-`0x3b62200`):
+
+- With an audio track, the player opens an `nn::audio` output stream (sysmix, 20 ms ring, notified
+  when 10 ms are free) and advances the video by `round((A - V) / frame / 2 + 1)` frames per game
+  frame, where A is the timestamp of the audio frame being written and V the shown video frame.
+- Without one (the intro and the title screen: no sysmix output stream is opened in the logs), it
+  adds the game's fixed frame step (`60 / N`, N an integer frame rate, so 1/60 s at 60 fps; not a
+  measured time) to an accumulator, advances `floor(acc / (60 / fps))` frames and subtracts them
+  from the accumulator before it knows whether the frames are there. A frame missing from the
+  player's queue at that moment is never made up: the video falls one frame further behind the
+  music, which the game plays in real time through the audio renderer.
+- The decoded frame reaches that queue through several guest threads: the player's handler releases
+  the shown frame, the movie library fetches the next one (vdecsvc 213, then 314), signals its
+  output event, the player's dispatcher posts a message and the handler acquires the frame.
+
+In the intro (log of build oot-latest2, limit 64): 9297 presents, 140 game frames that released no
+video frame and 62 that released two, so 78 frames lost, 1.30 s, the measured drift. The decoder
+writes each frame about 1 ms after the release that frees its image, so the loss is in the guest
+chain above, which only falls behind while the game reads the movie file.
+`tools/nx2/patches/ipc-trace-threads.patch` adds the calling thread, its core and its priority to
+`EDEN_NX2_IPC_TRACE` lines, to find which thread of that chain is late and what holds its core.

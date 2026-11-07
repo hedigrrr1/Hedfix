@@ -1,0 +1,37 @@
+diff --git a/src/core/hle/service/service.cpp b/src/core/hle/service/service.cpp
+index b47d67468b..828bd77812 100644
+--- a/src/core/hle/service/service.cpp
++++ b/src/core/hle/service/service.cpp
+@@ -23,6 +23,7 @@
+ #include "core/core.h"
+ #include "core/hle/ipc.h"
+ #include "core/hle/kernel/k_event.h"
++#include "core/hle/kernel/k_thread.h"
+ #include "core/hle/kernel/kernel.h"
+ #include "core/hle/service/ipc_helpers.h"
+ #include "core/hle/service/kernel_helpers.h"
+@@ -194,7 +195,10 @@ void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
+     // EDEN_NX2_IPC_TRACE=1 logs every dispatched command and the result word it returned.
+     static const bool ipc_trace = std::getenv("EDEN_NX2_IPC_TRACE") != nullptr;
+     if (ipc_trace) {
+-        LOG_INFO(Service, "ipc {}::{} ({})", service_name, ctx.GetCommand(), info->name);
++        const auto& thread = ctx.GetThread();
++        LOG_INFO(Service, "ipc {}::{} ({}) thread={} core={} prio={}", service_name,
++                 ctx.GetCommand(), info->name, thread.GetThreadId(), thread.GetActiveCore(),
++                 thread.GetPriority());
+     }
+     handler_invoker(this, info->handler_callback, ctx);
+     if (ipc_trace) {
+@@ -222,8 +226,10 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
+     static const bool ipc_trace = std::getenv("EDEN_NX2_IPC_TRACE") != nullptr;
+     if (ipc_trace) {
+         const auto* w = ctx.CommandBuffer();
+-        LOG_INFO(Service, "tipc {}::{} ({}) [2]={:#x} [3]={:#x} [4]={:#x}", service_name,
+-                 ctx.GetCommand(), info->name, w[2], w[3], w[4]);
++        const auto& thread = ctx.GetThread();
++        LOG_INFO(Service, "tipc {}::{} ({}) [2]={:#x} [3]={:#x} [4]={:#x} thread={} core={} prio={}",
++                 service_name, ctx.GetCommand(), info->name, w[2], w[3], w[4],
++                 thread.GetThreadId(), thread.GetActiveCore(), thread.GetPriority());
+     }
+     handler_invoker(this, info->handler_callback, ctx);
+ }
