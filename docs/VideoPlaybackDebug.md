@@ -110,3 +110,16 @@ messages (acquire, release, input) run on its own message thread, created by the
 Releases come in zero/two pairs when one release message runs a frame late; the frames really lost
 are the zeros not followed by a double. Next: `EDEN_NX2_SVC_TRACE=<first>:<last>` over presents
 that span a few losses, to see what that thread waits on.
+
+## Ocarina of Time: frame rate in Kokiri Forest
+
+`EDEN_NX2_GPU_PROFILE` (set it in the real environment: it is read before `nx2_switches.txt`) on
+build 115 at 35-40 fps: the guest cores work 1-2 ms a frame and the host GPU 10-13 ms; the split's
+back thread is ~80 % busy and its front waits for it ~540 ms a second, mostly to drain before macro
+`0xe2c`'s DMA reads (~30,000 a second, 24 bytes each, none on GPU-written pages) and semaphore
+acquires. `EDEN_NX2_SPLIT=1` (macros on the back) and `=0` were slower or equal.
+`tools/nx2/patches/oot-macro-dma-read.patch` (applies to build 115's branch and to `nx2`) waits for
+the writers, semaphore releases and host waits sent before such a read instead of the whole back,
+and drains only for pages the GPU wrote or that reports, releases and inline uploads target. On by
+default in Ocarina; `EDEN_NX2_DMA_READ_FAST=0/1` forces it. The log counts both kinds of reads
+(`Macro DMA reads: N without a drain, M drained`).
