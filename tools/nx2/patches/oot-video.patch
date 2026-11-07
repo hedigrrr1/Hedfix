@@ -1,0 +1,38 @@
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index fe02b57fcd..60abaa8fd2 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -2788,6 +2788,33 @@ private:
+         const u64 pts = u64{w[words]} | (u64{w[words + 1]} << 32);
+         const bool end = (w[words + 2] & 0xFF) != 0;
+         Log(ctx, "submit");
++        // Ocarina of Time submits until a submission fails. Accepting everything queued whole
++        // movies, and its player ran at 0.45-0.8x speed until the last packet was in, behind the
++        // audio. Mario Tennis drops refused packets, so the limit is per game.
++        // EDEN_NX2_VDEC_INPUT_LIMIT=<n> sets it for any game (0: none).
++        static const std::optional<size_t> forced_limit = []() -> std::optional<size_t> {
++            const char* value = std::getenv("EDEN_NX2_VDEC_INPUT_LIMIT");
++            if (value == nullptr) {
++                return std::nullopt;
++            }
++            return static_cast<size_t>(std::strtoul(value, nullptr, 10));
++        }();
++        const size_t input_limit = forced_limit.value_or(
++            system.GetApplicationProcessProgramID() == 0x0400486024DEC000ULL
++                ? Nx2VideoInputQueue::ReadyWatermark
++                : 0);
++        if (input_limit != 0) {
++            std::scoped_lock lk{m_mutex};
++            if (m_inputs.Size() >= input_limit) {
++                if (Nx2VideoTraceEnabled()) {
++                    LOG_INFO(Service, "nx2:vdec trace input full syncpoint={} queued={} pts={} eos={}",
++                             m_syncpoint, m_inputs.Size(), pts, end);
++                }
++                IPC::ResponseBuilder rb{ctx, 2};
++                rb.PushRaw<u32>(0x1c266f);
++                return;
++            }
++        }
+         Input input{{}, pts, end};
+         if (!ctx.BufferDescriptorA().empty()) {
+             const auto data = ctx.ReadBufferA(0);
