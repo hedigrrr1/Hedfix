@@ -102,3 +102,11 @@ steps (acquire after the output event, release after Advance), which make no ser
 `tools/nx2/patches/sched-late-run-trace.patch` adds `EDEN_NX2_SCHED_TRACE=<ms>`: every guest thread
 that waits longer than that between becoming runnable and running is logged with the thread its core
 was running at that moment.
+
+With the scheduler trace (intro, 117 game frames without a release): no guest thread waited for a
+core during the movie (late runs only at loading), so the player is not starved. The player's
+messages (acquire, release, input) run on its own message thread, created by the game as
+"ムービー入力読込" (movie input reading, `0x3b5e544`), which also feeds the decoder from the file.
+Releases come in zero/two pairs when one release message runs a frame late; the frames really lost
+are the zeros not followed by a double. Next: `EDEN_NX2_SVC_TRACE=<first>:<last>` over presents
+that span a few losses, to see what that thread waits on.
