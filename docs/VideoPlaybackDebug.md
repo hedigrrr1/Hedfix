@@ -130,3 +130,11 @@ occlusion count pages (ZPASS_PIXEL_COUNT reports, marked apart from other report
 apart: the first macro read of such a page in a frame drains and fetches the counts, the frame's
 later reads of it take those counts without a drain (`EDEN_NX2_ASYNC_OCCLUSION=0/1`, on with the
 fast reads). The log line gives the reasons the remaining reads drained.
+
+Second run: drained macro reads fell from ~30,000 to ~2,500 a second, but the front's time in them
+stayed ~300 ms a second (each now waits ~110 us instead of ~10 us) and the frame rate did not move:
+the back is ~88 % busy (split wait ~120 ms a second), so the front's waits only show that the back
+is the limit. The user also saw one or two very short white flashes with the occlusion reuse on.
+Do not use `oot-macro-dma-read.patch`; what limits Kokiri Forest is the back's own work (~25 ms a
+frame: 3D methods, unzoned time, draws, stage buffer binds, compute, buffer updates), which a
+faster build of the same code (clang-cl, ThinLTO, `lichii-windows.profdata`) speeds up.
