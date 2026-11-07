@@ -138,3 +138,11 @@ is the limit. The user also saw one or two very short white flashes with the occ
 Do not use `oot-macro-dma-read.patch`; what limits Kokiri Forest is the back's own work (~25 ms a
 frame: 3D methods, unzoned time, draws, stage buffer binds, compute, buffer updates), which a
 faster build of the same code (clang-cl, ThinLTO, `lichii-windows.profdata`) speeds up.
+
+Build 117 (official PGO build, DLSS, "Switch 2 draws with unbuilt pipelines" on Bounded wait):
+45-52 fps walking. The back now waits for the front ~320 ms a second while the front has no idle
+time: it waits for the back ~370 ms a second (macro DMA reads, acquires) and ~220 ms a second in
+`WaitForWriters` before command list entries (~8,400 a second) whose pages are not GPU-written.
+`tools/nx2/patches/oot-list-wait.patch` (build 117) waits once per command page: after an entry on
+it was read behind that wait and not found GPU-written, later entries on the page skip it.
+`EDEN_NX2_LIST_WAIT_SKIP=0/1`; on by default in Ocarina.

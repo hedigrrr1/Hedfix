@@ -1,0 +1,123 @@
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index af8fca936e..61fa89453d 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -198,10 +198,16 @@ bool DmaPusher::Step() {
+         // (the split only starts with unsafe reads; the settings can change mid-game).
+         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
+                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
+-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+-            gpu_written =
+-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
++        if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
++            const size_t bytes = size_t{header.size} * sizeof(u32);
++            if (!SkipsListWait() || !IsCpuListMemory(dma_state.dma_get, bytes)) {
++                if (VideoCommon::GpuSplit::Get().WaitForWriters()) {
++                    gpu_written = IsGpuWrittenCommands(dma_state.dma_get, bytes);
++                }
++                if (!gpu_written && SkipsListWait()) {
++                    MarkCpuListMemory(dma_state.dma_get, bytes);
++                }
++            }
+         }
+         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
+         const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
+@@ -596,6 +602,58 @@ void DmaPusher::RefreshDeferredEntries(CommandList& list) {
+     list.deferred_entries.clear();
+ }
+ 
++// EDEN_NX2_LIST_WAIT_SKIP=0/1 (on by default in Ocarina of Time): before each command list entry
++// the front waited for the compute and copy work queued on the split's back, in case it rewrote
++// the entry (~8,400 waits a second in Kokiri Forest, a fifth of the front's time). Command memory
++// the CPU writes is reused entry after entry: once an entry on a page was read after that wait and
++// the page was not GPU-written, later entries on it skip the wait. Pages the GPU writes are told
++// apart by IsGpuWrittenCommands before it, as before.
++bool DmaPusher::SkipsListWait() const {
++    static const int forced = [] {
++        const char* value = std::getenv("EDEN_NX2_LIST_WAIT_SKIP");
++        return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
++    }();
++    if (forced != -1) {
++        return forced == 1;
++    }
++    static const bool ocarina = system.GetApplicationProcessProgramID() == 0x0400486024DEC000ULL;
++    return ocarina;
++}
++
++bool DmaPusher::IsCpuListMemory(GPUVAddr address, size_t size) {
++    if (size == 0) {
++        return false;
++    }
++    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
++        const auto device = memory_manager.GpuToCpuAddress(page);
++        if (!device) {
++            return false;
++        }
++        const u64 index = *device >> Tegra::Nx2WrittenPageBits;
++        if (index >= Tegra::g_nx2_cpu_list_pages.size() * 64 ||
++            ((Tegra::g_nx2_cpu_list_pages[index / 64].load(std::memory_order_relaxed) >>
++              (index % 64)) & 1) == 0 ||
++            Tegra::Nx2IsGpuWritten(*device)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++void DmaPusher::MarkCpuListMemory(GPUVAddr address, size_t size) {
++    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
++        const auto device = memory_manager.GpuToCpuAddress(page);
++        if (!device || Tegra::Nx2IsGpuWritten(*device)) {
++            continue;
++        }
++        const u64 index = *device >> Tegra::Nx2WrittenPageBits;
++        if (index < Tegra::g_nx2_cpu_list_pages.size() * 64) {
++            Tegra::g_nx2_cpu_list_pages[index / 64].fetch_or(u64{1} << (index % 64),
++                                                             std::memory_order_relaxed);
++        }
++    }
++}
++
+ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
+     if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
+         return false;
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index 8c85eb3688..9aadba97f1 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -215,6 +215,9 @@ public:
+     void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
+     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+     /// Whether the entry lies on device pages the GPU has written (NX2).
++    bool SkipsListWait() const;
++    bool IsCpuListMemory(GPUVAddr address, size_t size);
++    void MarkCpuListMemory(GPUVAddr address, size_t size);
+     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
+     /// Copies the list's words from memory again, as of suspension count `now`.
+     void RefreshSnapshot(CommandList& list, u64 now);
+diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
+index e85e6142e7..7af1348efb 100644
+--- a/src/video_core/nx2.h
++++ b/src/video_core/nx2.h
+@@ -84,6 +84,10 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
+     return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
+ }
+ 
++// Device pages the split's front has read command lists from after waiting for the compute and
++// copy work sent before them, and found not GPU-written (DmaPusher::Step). Front thread only.
++inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_cpu_list_pages{};
++
+ /// A new emulation session starts: no page has been written by its GPU yet.
+ inline void Nx2ClearGpuWrittenPages() {
+     for (auto& word : g_nx2_gpu_written_pages) {
+@@ -92,6 +96,9 @@ inline void Nx2ClearGpuWrittenPages() {
+     for (auto& word : g_nx2_command_list_pages) {
+         word.store(0, std::memory_order_relaxed);
+     }
++    for (auto& word : g_nx2_cpu_list_pages) {
++        word.store(0, std::memory_order_relaxed);
++    }
+     g_nx2_has_command_list_pages.store(false, std::memory_order_relaxed);
+ }
+ 
