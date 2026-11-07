@@ -123,3 +123,10 @@ the writers, semaphore releases and host waits sent before such a read instead o
 and drains only for pages the GPU wrote or that reports, releases and inline uploads target. On by
 default in Ocarina; `EDEN_NX2_DMA_READ_FAST=0/1` forces it. The log counts both kinds of reads
 (`Macro DMA reads: N without a drain, M drained`).
+
+First run of that patch: 10 of 1,310,720 reads skipped the drain; the rest read report or
+GPU-written pages (occlusion counts, by the query types the log shows). The patch now keeps
+occlusion count pages (ZPASS_PIXEL_COUNT reports, marked apart from other reports and releases)
+apart: the first macro read of such a page in a frame drains and fetches the counts, the frame's
+later reads of it take those counts without a drain (`EDEN_NX2_ASYNC_OCCLUSION=0/1`, on with the
+fast reads). The log line gives the reasons the remaining reads drained.

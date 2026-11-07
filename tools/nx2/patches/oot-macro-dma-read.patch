@@ -13,19 +13,31 @@ index af8fca936e..d7d9a55567 100644
  }
  
 diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
-index 29a9ceab3d..74d03f63f2 100644
+index 29a9ceab3d..3604896f6b 100644
 --- a/src/video_core/engines/maxwell_3d.cpp
 +++ b/src/video_core/engines/maxwell_3d.cpp
-@@ -1045,6 +1045,8 @@ struct Maxwell3D::FrontState {
+@@ -11,6 +11,7 @@
+ #include <limits>
+ #include <optional>
+ #include <string>
++#include <unordered_map>
+ #include "common/assert.h"
+ #include "common/bit_util.h"
+ #include "common/scope_exit.h"
+@@ -1045,6 +1046,12 @@ struct Maxwell3D::FrontState {
      bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
      /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
      bool instance_loop{};
 +    /// Macro DMA reads of pages nothing but the CPU writes skip the drain (FrontReadWithoutDrain).
 +    bool dma_read_fast{};
++    /// Occlusion count pages read again in the frame that read them drained (EDEN_NX2_ASYNC_OCCLUSION).
++    bool async_occlusion{};
++    /// Device page -> the present during which a drained read last fetched its counts.
++    std::unordered_map<u64, u64> occlusion_synced;
  };
  
  namespace {
-@@ -1113,6 +1115,15 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
+@@ -1113,6 +1120,23 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
          std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
          front->control = shadow_state.shadow_ram_control;
          front->skip_same = SkipSameValueWrites() && FrontSkipSame();
@@ -38,10 +50,18 @@ index 29a9ceab3d..74d03f63f2 100644
 +        front->dma_read_fast = dma_read_fast != -1
 +                                   ? dma_read_fast == 1
 +                                   : system.GetApplicationProcessProgramID() == 0x0400486024DEC000ULL;
++        // EDEN_NX2_ASYNC_OCCLUSION=0/1: within a frame, macro reads of occlusion counts after the
++        // first take the counts that read fetched (on by default with the fast reads above).
++        static const int async_occlusion = [] {
++            const char* value = std::getenv("EDEN_NX2_ASYNC_OCCLUSION");
++            return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
++        }();
++        front->async_occlusion =
++            async_occlusion != -1 ? async_occlusion == 1 : front->dma_read_fast;
          front->executing_macro = executing_macro;
          front->parameters = std::move(macro_params);
          macro_params.clear();
-@@ -1173,6 +1184,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+@@ -1173,6 +1197,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
          fs.regs[method] = value;
      } else {
          fs.regs[method] = value;
@@ -49,7 +69,7 @@ index 29a9ceab3d..74d03f63f2 100644
          constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
          switch (method) {
          case MAXWELL3D_REG_INDEX(shadow_ram_control):
-@@ -1288,6 +1300,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+@@ -1288,6 +1313,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
              if (!execution_mask[method]) {
                  continue;
              }
@@ -57,7 +77,7 @@ index 29a9ceab3d..74d03f63f2 100644
              switch (method) {
              case MAXWELL3D_REG_INDEX(shadow_ram_control):
                  fs.control = static_cast<Regs::ShadowRamControl>(argument);
-@@ -1414,6 +1427,72 @@ bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool
+@@ -1414,6 +1440,153 @@ bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool
      return method != MAXWELL3D_REG_INDEX(draw.end) || fs.instance_loop;
  }
  
@@ -81,7 +101,19 @@ index 29a9ceab3d..74d03f63f2 100644
 +        const GPUVAddr address =
 +            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)] & 0xff} << 32) |
 +            fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
-+        mark(address & ~GPUVAddr{0xf}, 16);
++        const u32 query = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.query)];
++        const u32 operation = query & 3;     // Release 0, Acquire 1, ReportOnly 2
++        const u32 report = (query >> 23) & 0x1f;
++        if ((operation == 0 || operation == 2) && (report == 2 || report == 21)) {
++            const GPUVAddr page = address & ~GPUVAddr{0xfff};
++            for (GPUVAddr at = page; at < ((address + 16 + 0xfff) & ~GPUVAddr{0xfff}); at += 0x1000) {
++                if (const auto device = memory_manager.GpuToCpuAddress(at)) {
++                    Tegra::Nx2MarkOcclusionPages(*device, 0x1000);
++                }
++            }
++        } else {
++            mark(address & ~GPUVAddr{0xf}, 16);
++        }
 +        break;
 +    }
 +    case MAXWELL3D_REG_INDEX(launch_dma): {
@@ -102,35 +134,104 @@ index 29a9ceab3d..74d03f63f2 100644
 +// the writers, semaphore releases and host-level waits sent before it have run (a draw's shader
 +// stores need one of those before the hardware's macros may read them too), pages the GPU never
 +// wrote and no report or upload targets hold what the CPU wrote, and guest memory has it.
++// Occlusion counts are read drained once per page and frame; later reads in that frame take the
++// counts that read fetched, as reads of counts the GPU hasn't reported yet would on hardware.
 +bool Maxwell3D::FrontReadWithoutDrain(VideoCommon::GpuSplit& split, FrontState& fs,
 +                                      GPUVAddr source, size_t size) {
 +    static std::atomic<u64> fast_reads{};
++    static std::atomic<u64> occlusion_reads{};
 +    static std::atomic<u64> drained_reads{};
-+    split.WaitForReadWriters(VideoCommon::DrainSite::MacroDmaRead);
-+    bool fast = size != 0;
++    // Why drained reads drained: GPU-written page, report or release page, occlusion counts not
++    // yet fetched this frame, unmapped.
++    static std::array<std::atomic<u64>, 4> reasons{};
++    const auto count = [](std::atomic<u64>& counter) {
++        counter.fetch_add(1, std::memory_order_relaxed);
++        const u64 total = fast_reads.load(std::memory_order_relaxed) +
++                          occlusion_reads.load(std::memory_order_relaxed) +
++                          drained_reads.load(std::memory_order_relaxed);
++        if ((total & 0x3ffff) == 0) {
++            LOG_INFO(HW_GPU,
++                     "Macro DMA reads: {} without a drain, {} occlusion counts kept, {} drained "
++                     "(GPU-written {}, report {}, occlusion first read {}, unmapped {})",
++                     fast_reads.load(std::memory_order_relaxed),
++                     occlusion_reads.load(std::memory_order_relaxed),
++                     drained_reads.load(std::memory_order_relaxed),
++                     reasons[0].load(std::memory_order_relaxed),
++                     reasons[1].load(std::memory_order_relaxed),
++                     reasons[2].load(std::memory_order_relaxed),
++                     reasons[3].load(std::memory_order_relaxed));
++        }
++    };
++    if (size == 0) {
++        count(drained_reads);
++        return false;
++    }
 +    constexpr GPUVAddr page_size = 0x1000;
 +    const GPUVAddr end = source + size;
-+    for (GPUVAddr begin = source; fast && begin < end;) {
-+        const GPUVAddr page_end = (std::min)((begin & ~(page_size - 1)) + page_size, end);
-+        const auto device = memory_manager.GpuToCpuAddress(begin);
-+        fast = device && !Tegra::Nx2MayBeGpuWritten(*device, page_end - begin) &&
-+               !Tegra::Nx2MayBeReportPage(*device, page_end - begin);
-+        begin = page_end;
++    // 0: CPU-only pages, 1: occlusion count pages read drained this frame, 2: drain.
++    int reason = 3;
++    const auto classify = [&](bool occlusion_allowed) {
++        int kind = -1;
++        const u64 present = Core::g_nx2_present_count.load(std::memory_order_relaxed);
++        for (GPUVAddr begin = source; begin < end;) {
++            const GPUVAddr page_end = (std::min)((begin & ~(page_size - 1)) + page_size, end);
++            const auto device = memory_manager.GpuToCpuAddress(begin);
++            int page_kind = 2;
++            if (!device) {
++                reason = 3;
++            } else if (Tegra::Nx2MayBeGpuWritten(*device, page_end - begin)) {
++                reason = 0;
++            } else if (Tegra::Nx2MayBeReportPage(*device, page_end - begin)) {
++                reason = 1;
++            } else if (!Tegra::Nx2IsOcclusionPage(*device)) {
++                page_kind = 0;
++            } else {
++                reason = 2;
++                if (occlusion_allowed) {
++                    const auto it = fs.occlusion_synced.find(*device >> 12);
++                    page_kind = it != fs.occlusion_synced.end() && it->second == present ? 1 : 2;
++                }
++            }
++            kind = kind == -1 || kind == page_kind ? page_kind : 2;
++            if (kind == 2) {
++                break;
++            }
++            begin = page_end;
++        }
++        return kind;
++    };
++    if (classify(fs.async_occlusion) == 1) {
++        count(occlusion_reads);
++        return true;
 +    }
-+    const u64 total = (fast ? fast_reads : drained_reads).fetch_add(1, std::memory_order_relaxed) +
-+                      1 + (fast ? drained_reads : fast_reads).load(std::memory_order_relaxed);
-+    if ((total & 0x3ffff) == 0) {
-+        LOG_INFO(HW_GPU, "Macro DMA reads: {} without a drain, {} drained",
-+                 fast_reads.load(std::memory_order_relaxed),
-+                 drained_reads.load(std::memory_order_relaxed));
++    split.WaitForReadWriters(VideoCommon::DrainSite::MacroDmaRead);
++    if (classify(false) == 0) {
++        count(fast_reads);
++        return true;
 +    }
-+    return fast;
++    reasons[reason].fetch_add(1, std::memory_order_relaxed);
++    count(drained_reads);
++    return false;
++}
++
++// A drained read fetched the counts of these occlusion pages: the frame's later reads reuse them.
++void Maxwell3D::FrontNoteOcclusionSync(FrontState& fs, GPUVAddr source, size_t size) {
++    if (!fs.async_occlusion) {
++        return;
++    }
++    const u64 present = Core::g_nx2_present_count.load(std::memory_order_relaxed);
++    for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + size; page += 0x1000) {
++        if (const auto device = memory_manager.GpuToCpuAddress(page);
++            device && Tegra::Nx2IsOcclusionPage(*device)) {
++            fs.occlusion_synced[*device >> 12] = present;
++        }
++    }
 +}
 +
  void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
                               u32 method, u32 count) {
      // The words may be written by methods still queued for the back (indirect draw arguments
-@@ -1428,6 +1507,18 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+@@ -1428,6 +1601,18 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
          memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
      }
      VideoCommon::Nx2Profile::CountDmaRead(macro);
@@ -149,16 +250,25 @@ index 29a9ceab3d..74d03f63f2 100644
      split.Drain(VideoCommon::DrainSite::MacroDmaRead);
      if (VideoCommon::QueryDma::TraceEnabled()) {
          split.Run(
+@@ -1456,6 +1641,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+             VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
+         },
+         VideoCommon::DrainSite::MacroDmaFlush);
++    FrontNoteOcclusionSync(fs, source, read_bytes);
+     u32 changed{};
+     for (u32 i = 0; i < words; ++i) {
+         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
 diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
-index 97790bbcbd..5ca48ff182 100644
+index 97790bbcbd..191620b4a4 100644
 --- a/src/video_core/engines/maxwell_3d.h
 +++ b/src/video_core/engines/maxwell_3d.h
-@@ -3405,6 +3405,9 @@ private:
+@@ -3405,6 +3405,10 @@ private:
      bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
      void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                        u32 count);
 +    bool FrontReadWithoutDrain(VideoCommon::GpuSplit& split, FrontState& state, GPUVAddr source,
 +                               size_t size);
++    void FrontNoteOcclusionSync(FrontState& state, GPUVAddr source, size_t size);
 +    void FrontNoteMemoryWrite(FrontState& state, u32 method);
      void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
      void FinishFrontMacro(Core::System& system);
@@ -242,10 +352,10 @@ index 2e9250ff53..ebe8899b7e 100644
      u64 published_local{};
      u64 consumed_cache{};
 diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
-index e85e6142e7..ae5100ec0f 100644
+index 7431fc5e37..81da02e077 100644
 --- a/src/video_core/nx2.h
 +++ b/src/video_core/nx2.h
-@@ -84,6 +84,44 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
+@@ -71,6 +71,71 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
      return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
  }
  
@@ -287,29 +397,64 @@ index e85e6142e7..ae5100ec0f 100644
 +    return false;
 +}
 +
++// Device pages occlusion counts (ZPASS_PIXEL_COUNT reports) are written to, ever. Marked like
++// g_nx2_report_pages, which takes every other report instead.
++inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_occlusion_pages{};
++
++inline void Nx2MarkOcclusionPages(u64 device_address, u64 size) {
++    if (size == 0) {
++        return;
++    }
++    const u64 last = std::min<u64>((device_address + size - 1) >> Nx2WrittenPageBits,
++                                   g_nx2_occlusion_pages.size() * 64 - 1);
++    for (u64 page = device_address >> Nx2WrittenPageBits; page <= last; ++page) {
++        auto& word = g_nx2_occlusion_pages[page / 64];
++        const u64 bit = u64{1} << (page % 64);
++        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
++            word.fetch_or(bit, std::memory_order_relaxed);
++        }
++    }
++}
++
++[[nodiscard]] inline bool Nx2IsOcclusionPage(u64 device_address) {
++    const u64 page = device_address >> Nx2WrittenPageBits;
++    if (page >= g_nx2_occlusion_pages.size() * 64) {
++        return false;
++    }
++    return (g_nx2_occlusion_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
++}
++
  /// A new emulation session starts: no page has been written by its GPU yet.
  inline void Nx2ClearGpuWrittenPages() {
      for (auto& word : g_nx2_gpu_written_pages) {
-@@ -92,6 +130,9 @@ inline void Nx2ClearGpuWrittenPages() {
+@@ -79,6 +144,12 @@ inline void Nx2ClearGpuWrittenPages() {
      for (auto& word : g_nx2_command_list_pages) {
          word.store(0, std::memory_order_relaxed);
      }
 +    for (auto& word : g_nx2_report_pages) {
 +        word.store(0, std::memory_order_relaxed);
 +    }
++    for (auto& word : g_nx2_occlusion_pages) {
++        word.store(0, std::memory_order_relaxed);
++    }
      g_nx2_has_command_list_pages.store(false, std::memory_order_relaxed);
  }
  
 diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
-index efa148bf06..1f3a8ab488 100644
+index 1cd92dcfe2..043c6728ce 100644
 --- a/src/video_core/query_cache/query_cache.h
 +++ b/src/video_core/query_cache/query_cache.h
-@@ -268,6 +268,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+@@ -268,6 +268,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
          return;
      }
      DAddr cpu_addr = *cpu_addr_opt;
 +    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
-+        Tegra::Nx2MarkReportPages(cpu_addr, has_timestamp ? 16 : 8);
++        if (requested_type == QueryType::ZPassPixelCount ||
++            requested_type == QueryType::ZPassPixelCount64) {
++            Tegra::Nx2MarkOcclusionPages(cpu_addr, has_timestamp ? 16 : 8);
++        } else {
++            Tegra::Nx2MarkReportPages(cpu_addr, has_timestamp ? 16 : 8);
++        }
 +    }
      const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
      auto* query = streamer->GetQuery(new_query_id);
