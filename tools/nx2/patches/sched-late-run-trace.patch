@@ -1,0 +1,121 @@
+diff --git a/src/core/hle/kernel/k_scheduler.cpp b/src/core/hle/kernel/k_scheduler.cpp
+index 3156a17064..aef184c836 100644
+--- a/src/core/hle/kernel/k_scheduler.cpp
++++ b/src/core/hle/kernel/k_scheduler.cpp
+@@ -5,6 +5,10 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <bit>
++#include <chrono>
++#include <cstdlib>
++#include <mutex>
++#include <unordered_map>
+ 
+ #include "common/assert.h"
+ #include "common/bit_util.h"
+@@ -24,6 +28,80 @@
+ 
+ namespace Kernel {
+ 
++namespace {
++// EDEN_NX2_SCHED_TRACE=<ms>: log every guest thread that waits longer than that between becoming
++// runnable and running, with the thread its core was running when it became runnable.
++struct LateRunTracer {
++    struct Pending {
++        std::chrono::steady_clock::time_point since;
++        u64 blocker_id;
++        s32 blocker_priority;
++        s32 core;
++    };
++
++    static LateRunTracer& Get() {
++        static LateRunTracer tracer;
++        return tracer;
++    }
++
++    const std::chrono::microseconds threshold{[] {
++        const char* text = std::getenv("EDEN_NX2_SCHED_TRACE");
++        return text ? static_cast<long long>(std::strtod(text, nullptr) * 1000.0) : 0LL;
++    }()};
++    std::mutex mutex;
++    std::unordered_map<const KThread*, Pending> pending;
++
++    bool Enabled() const {
++        return threshold.count() > 0;
++    }
++
++    void OnRunnable(KernelCore& kernel, const KThread* thread) {
++        const s32 core = thread->GetActiveCore();
++        u64 blocker_id = 0;
++        s32 blocker_priority = -1;
++        if (core >= 0 && core < static_cast<s32>(Core::Hardware::NUM_CPU_CORES)) {
++            const auto& scheduler = kernel.Scheduler(core);
++            const KThread* running = scheduler.GetSchedulerCurrentThread();
++            if (running != nullptr && running != scheduler.GetIdleThread()) {
++                blocker_id = running->GetThreadId();
++                blocker_priority = running->GetPriority();
++            }
++        }
++        std::scoped_lock lk{mutex};
++        pending[thread] = {std::chrono::steady_clock::now(), blocker_id, blocker_priority, core};
++    }
++
++    void OnNotRunnable(const KThread* thread) {
++        std::scoped_lock lk{mutex};
++        pending.erase(thread);
++    }
++
++    void OnRun(const KThread* thread, const KThread* previous, s32 core) {
++        Pending entry{};
++        {
++            std::scoped_lock lk{mutex};
++            const auto it = pending.find(thread);
++            if (it == pending.end()) {
++                return;
++            }
++            entry = it->second;
++            pending.erase(it);
++        }
++        const auto waited = std::chrono::steady_clock::now() - entry.since;
++        if (waited < threshold) {
++            return;
++        }
++        LOG_INFO(Kernel, "late run: thread={} prio={} affinity={:#x} core={} waited={:.2f}ms "
++                         "running_at_wake={}/{} on core {} previous={}/{}",
++                 thread->GetThreadId(), thread->GetPriority(),
++                 thread->GetAffinityMask().GetAffinityMask(), core,
++                 std::chrono::duration<double, std::milli>(waited).count(), entry.blocker_id,
++                 entry.blocker_priority, entry.core, previous ? previous->GetThreadId() : 0,
++                 previous ? previous->GetPriority() : -1);
++    }
++};
++} // namespace
++
+ static void IncrementScheduledCount(Kernel::KThread* thread) {
+     if (auto process = thread->GetOwnerProcess(); process) {
+         process->IncrementScheduledCount();
+@@ -370,6 +448,10 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
+     //     KProcess::Switch(cur_process, next_process);
+     // }
+ 
++    if (auto& tracer = LateRunTracer::Get(); tracer.Enabled() && next_thread != m_idle_thread) {
++        tracer.OnRun(next_thread, cur_thread, m_core_id);
++    }
++
+     // Set the new thread.
+     SetCurrentThread(kernel, next_thread);
+     m_current_thread = next_thread;
+@@ -530,6 +612,13 @@ void KScheduler::OnThreadStateChanged(KernelCore& kernel, KThread* thread, Threa
+     // Check if the state has changed, because if it hasn't there's nothing to do.
+     if (const ThreadState cur_state = thread->GetRawState(); cur_state != old_state) {
+         // Update the priority queues.
++        if (auto& tracer = LateRunTracer::Get(); tracer.Enabled() && !thread->IsDummyThread()) {
++            if (cur_state == ThreadState::Runnable) {
++                tracer.OnRunnable(kernel, thread);
++            } else if (old_state == ThreadState::Runnable) {
++                tracer.OnNotRunnable(thread);
++            }
++        }
+         if (old_state == ThreadState::Runnable) {
+             // If we were previously runnable, then we're not runnable now, and we should remove.
+             GetPriorityQueue(kernel).Remove(thread);

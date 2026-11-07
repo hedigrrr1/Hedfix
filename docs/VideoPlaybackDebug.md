@@ -92,3 +92,13 @@ writes each frame about 1 ms after the release that frees its image, so the loss
 chain above, which only falls behind while the game reads the movie file.
 `tools/nx2/patches/ipc-trace-threads.patch` adds the calling thread, its core and its priority to
 `EDEN_NX2_IPC_TRACE` lines, to find which thread of that chain is late and what holds its core.
+
+With that trace (intro, 61 frames lost): the movie library's decoder thread (core 5, priority 45)
+submits packets, releases images (314) and arms the fence (syncpt 201); its event-manager thread
+(any core, priority 44) fetches each frame (213) once the player has handed back the previous one.
+Both calls land within 2 ms before the present, and the input limit rejected only 172 packets in the
+whole run, so neither the decoder nor the limit is late. The late link is one of the player's own
+steps (acquire after the output event, release after Advance), which make no service calls.
+`tools/nx2/patches/sched-late-run-trace.patch` adds `EDEN_NX2_SCHED_TRACE=<ms>`: every guest thread
+that waits longer than that between becoming runnable and running is logged with the thread its core
+was running at that moment.
