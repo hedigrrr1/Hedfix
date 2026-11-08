@@ -146,3 +146,9 @@ time: it waits for the back ~370 ms a second (macro DMA reads, acquires) and ~22
 `tools/nx2/patches/oot-list-wait.patch` (build 117) waits once per command page: after an entry on
 it was read behind that wait and not found GPU-written, later entries on the page skip it.
 `EDEN_NX2_LIST_WAIT_SKIP=0/1`; on by default in Ocarina.
+
+`tools/nx2/mods/occlusion-off` is cLohan's community patch (zortos293/Lichii#641, opt-in in
+Frizti's Fritchii) as a Lichii IPS32 mod for main build `e0f3ccfa`: six `ldrb w8, [x0]` (checked)
+become `mov w8, wzr` where the game stores its `CreateZPrePassOcclusionQuery` and
+`CreateSamplesPassedQuery` render options, so it makes no occlusion queries, no conditional renders
+and no macro reads of their counts. Put the folder in the game's mod directory.
